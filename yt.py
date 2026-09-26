@@ -1942,28 +1942,16 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
     if is_interaction and not source.response.is_done():
         await source.response.defer()
     valid_tasks = []
-    preflight_stopped = False
     for target_url, url_type, is_silent in tasks_to_process:
         if not is_dm and await is_url_type_excluded(guild_id, url_type):
             continue
         target_id = get_video_id(target_url)
         if await is_url_excluded_globally(target_id):
             continue
-        archive_url = await check_existing_archive(target_url)
-        if archive_url:
-            preflight_stopped = True
-            await complete_existing_archive(
-                target_url, url_type, archive_url, guild_id, user.id,
-                source=source, is_silent=is_silent and not is_interaction,
-                send_response=send_response if is_interaction else None
-            )
-            continue
         valid_tasks.append((target_url, url_type, is_silent))
 
     tasks_to_process = valid_tasks
     if not tasks_to_process:
-        if preflight_stopped:
-            return
         if is_interaction:
             await send_response("The provided URL(s) are excluded from archiving", ephemeral=True)
         return
@@ -2147,30 +2135,31 @@ async def execute_archive_request(
     """
     Handles the actual execution: triggering workflow, updating UI, logging to DB, and starting monitor
     """
-    # Recheck after a queue wait or retry before cookies or dispatch
-    archive_url = await check_existing_archive(target_url)
-    if archive_url:
-        try:
-            await complete_existing_archive(
-                target_url, url_type, archive_url, guild_id, user_id,
-                source=original_message, is_silent=is_silent, batch_id=batch_id
-            )
-        finally:
-            client.active_jobs[user_id] = max(0, client.active_jobs[user_id] - 1)
-            await client.save_state()
-            await check_and_process_queue(user_id)
-        return
-
     # Initial User Feedback (Only if not silent)
     status_msg = original_message if is_cookie_retry else None
     if not is_cookie_retry and not batch_id and not is_silent and original_message:
         try:
             if getattr(original_message, "author", None) and original_message.author.id == client.user.id:
                 status_msg = original_message
+                await status_msg.edit(content=f"Sending request to preserve YouTube {url_type}\n\n[||Target||](<{target_url}>)")
             else:
                 status_msg = await original_message.reply(f"Sending request to preserve YouTube {url_type}\n\n[||Target||](<{target_url}>)")
         except:
             pass
+
+    # Recheck after a queue wait or retry before cookies or dispatch
+    archive_url = await check_existing_archive(target_url)
+    if archive_url:
+        try:
+            await complete_existing_archive(
+                target_url, url_type, archive_url, guild_id, user_id,
+                source=status_msg or original_message, is_silent=is_silent, batch_id=batch_id
+            )
+        finally:
+            client.active_jobs[user_id] = max(0, client.active_jobs[user_id] - 1)
+            await client.save_state()
+            await check_and_process_queue(user_id)
+        return
 
     bot_trace_slot_acquired = False
     if is_bot_request:
