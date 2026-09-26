@@ -77,6 +77,24 @@ class YouTubeCookiesUnavailable(Exception):
     """Keep the request queued until an eligible cookie secret is available"""
 
 
+def format_archive_complete(icon, status_text, archive_url, trace_id=None):
+    message = (
+        f"{icon} Archive Complete\n"
+        f"Status: {status_text}\n"
+        f"Archive URL: {archive_url}"
+    )
+    if trace_id:
+        message += f"\n\n||Trace ID: `{trace_id}`||"
+    return message
+
+
+def format_existing_archive(url_type, archive_url, trace_id=None):
+    return format_archive_complete(
+        "<:minus:1455628978584027228>",
+        f"{url_type} is already archived", archive_url, trace_id
+    )
+
+
 def has_invalid_youtube_cookies(log_text):
     return bool(re.search(
         r"the\s+provided\s+youtube\s+account\s+cookies\s+are\s+no\s+longer\s+valid\b",
@@ -758,12 +776,7 @@ class ArchiveBot(discord.Client):
                     urls_content = "\n".join(archive_urls).encode('utf-8')
                     attachment_file = discord.File(fp=io.BytesIO(urls_content), filename=f"urls_{trace_id}.txt")
 
-            final_msg = (
-                f"{icon} Archive Complete\n"
-                f"Status: {status_text}\n"
-                f"Archive URL: {display_url}\n\n"
-                f"||Trace ID: `{trace_id}`||"
-            )
+            final_msg = format_archive_complete(icon, status_text, display_url, trace_id)
             
             try:
                 edit_kwargs = {"content": final_msg, "embed": None}
@@ -1877,15 +1890,46 @@ def extract_tasks_from_text(text):
             
     return tasks_to_process
 
+async def complete_existing_archive(target_url, url_type, archive_url, guild_id, user_id,
+                                    source=None, is_silent=False, batch_id=None, send_response=None):
+    """Record a metadata match locally and show the normal completion sequence"""
+    trace_id = str(uuid.uuid4())[:8]
+    # No GitHub run exists, the trace identifies this local history record
+    await log_history(guild_id, user_id, target_url, "Already archived", None, trace_id)
+    status_msg = None
+    if not is_silent and not batch_id and source:
+        initial = f"Sending request to preserve YouTube {url_type}\n\n[||Target||](<{target_url}>)"
+        try:
+            if send_response:
+                status_msg = await send_response(initial)
+            elif getattr(getattr(source, "author", None), "id", None) == client.user.id:
+                status_msg = source
+                await status_msg.edit(content=initial)
+            else:
+                status_msg = await source.reply(initial)
+            await status_msg.edit(content=f"<a:loading:1455572437277348005> YouTube {url_type} is being preserved\n\n||Trace ID: `{trace_id}`||")
+        except Exception as error:
+            logging.warning("Could not show local archive status: %s", error)
+    await asyncio.sleep(5)
+    if status_msg:
+        try:
+            await status_msg.edit(content=format_existing_archive(url_type, archive_url, trace_id),
+                                  embed=None, suppress=True)
+        except Exception as error:
+            logging.warning("Could not show existing archive completion: %s", error)
+    if batch_id:
+        await client.update_batch_progress(batch_id, is_success=True, archive_urls=[archive_url])
+
+
 async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_space):
     is_interaction = isinstance(source, discord.Interaction)
     is_dm = guild_id is None
     is_bot_request = bool(getattr(user, "bot", False))
 
-    async def send_response(text, ephemeral=False):
+    async def send_response(text, ephemeral=False, suppress_embeds=False):
         if source.response.is_done():
-            return await source.followup.send(text, ephemeral=ephemeral, wait=True)
-        await source.response.send_message(text, ephemeral=ephemeral)
+            return await source.followup.send(text, ephemeral=ephemeral, wait=True, suppress_embeds=suppress_embeds)
+        await source.response.send_message(text, ephemeral=ephemeral, suppress_embeds=suppress_embeds)
         return await source.original_response()
 
     if await is_user_globally_excluded(user.id):
@@ -1904,17 +1948,14 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
     for target_url, url_type, is_silent in tasks_to_process:
         if not is_dm and await is_url_type_excluded(guild_id, url_type):
             continue
-        try:
-            archive_url = await check_existing_archive(target_url)
-            notice = f"YouTube {url_type} is already archived\n\n{archive_url}" if archive_url else None
-        except RuntimeError as error:
-            notice = str(error)
-        if notice:
+        archive_url = await check_existing_archive(target_url)
+        if archive_url:
             preflight_stopped = True
-            if is_interaction:
-                await send_response(notice)
-            elif not is_silent:
-                await source.reply(notice)
+            await complete_existing_archive(
+                target_url, url_type, archive_url, guild_id, user.id,
+                source=source, is_silent=is_silent and not is_interaction,
+                send_response=send_response if is_interaction else None
+            )
             continue
         target_id = get_video_id(target_url)
         if await is_url_excluded_globally(target_id):
@@ -2108,25 +2149,14 @@ async def execute_archive_request(
     """
     Handles the actual execution: triggering workflow, updating UI, logging to DB, and starting monitor
     """
-    # Recheck after a queue wait or retry before feedback, cookies, or dispatch
-    try:
-        archive_url = await check_existing_archive(target_url)
-        preflight_notice = f"YouTube {url_type} is already archived\n\n{archive_url}" if archive_url else None
-    except RuntimeError as error:
-        archive_url = None
-        preflight_notice = str(error)
-    if preflight_notice:
+    # Recheck after a queue wait or retry before cookies or dispatch
+    archive_url = await check_existing_archive(target_url)
+    if archive_url:
         try:
-            if not is_silent and not batch_id and original_message:
-                if getattr(getattr(original_message, "author", None), "id", None) == client.user.id:
-                    await original_message.edit(content=preflight_notice)
-                else:
-                    await original_message.reply(preflight_notice)
-            if batch_id:
-                await client.update_batch_progress(
-                    batch_id, is_success=bool(archive_url),
-                    archive_urls=[archive_url] if archive_url else None
-                )
+            await complete_existing_archive(
+                target_url, url_type, archive_url, guild_id, user_id,
+                source=original_message, is_silent=is_silent, batch_id=batch_id
+            )
         finally:
             client.active_jobs[user_id] = max(0, client.active_jobs[user_id] - 1)
             await client.save_state()
@@ -2756,7 +2786,7 @@ async def traceinfo(interaction: discord.Interaction, trace_id: str):
             timestamp_str = timestamp
             
         embed.add_field(name="Timestamp", value=timestamp_str, inline=True)
-        embed.add_field(name="Run ID", value=str(run_id), inline=True)
+        embed.add_field(name="Run ID", value=str(run_id) if run_id is not None else "No workflow started", inline=True)
         
         await interaction.response.send_message(embed=embed)
         return
