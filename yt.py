@@ -1542,25 +1542,20 @@ async def check_existing_archive(url):
     video_id = get_video_id(url)
     if not video_id or not re.fullmatch(r'[A-Za-z0-9_-]+', video_id):
         return None
-    identifier = f"youtube-{video_id}"
+    # TubeUp uses get_itemname (youtube-ID) followed by internetarchive Item.exists
+    identifier = re.sub(r'[^\w-]', '-', f"youtube-{video_id}")
+
+    def item_exists():
+        return ia.get_item(identifier, request_kwargs={"timeout": 15}).exists
+
     try:
-        async with client.session.get(
-            f"https://archive.org/metadata/{identifier}",
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as response:
-            if response.status != 200:
-                raise ValueError(f"Metadata HTTP status {response.status}")
-            data = await response.json()
-        if data == {} or data == []:
-            return None
-        if isinstance(data, dict) and not data.get('error'):
-            metadata = data.get('metadata')
-            if isinstance(metadata, dict) and metadata.get('identifier') == identifier:
-                return f"https://archive.org/details/{identifier}"
-        raise ValueError("Unrecognized archive metadata response")
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+        # internetarchive performs synchronous I/O, keep it off Discord's event loop
+        exists = await asyncio.wait_for(asyncio.to_thread(item_exists), timeout=20)
+        if exists:
+            return f"https://archive.org/details/{identifier}"
+    except Exception as error:
         logging.warning("Archive preflight failed for %s, continuing normally: %s", identifier, error)
-        return None
+    return None
 
 
 def determine_url_type(url):
