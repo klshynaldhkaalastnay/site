@@ -1893,6 +1893,9 @@ def extract_tasks_from_text(text):
 async def complete_existing_archive(target_url, url_type, archive_url, guild_id, user_id,
                                     source=None, is_silent=False, batch_id=None, send_response=None):
     """Record a metadata match locally and show the normal completion sequence"""
+    video_id = get_video_id(target_url)
+    await add_to_global_excluded_file(video_id, get_category_for_url_type(url_type))
+    await make_global_exclusion_permanent(video_id)
     trace_id = str(uuid.uuid4())[:8]
     # No GitHub run exists, the trace identifies this local history record
     await log_history(guild_id, user_id, target_url, "Already archived", None, trace_id)
@@ -1948,6 +1951,9 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
     for target_url, url_type, is_silent in tasks_to_process:
         if not is_dm and await is_url_type_excluded(guild_id, url_type):
             continue
+        target_id = get_video_id(target_url)
+        if await is_url_excluded_globally(target_id):
+            continue
         archive_url = await check_existing_archive(target_url)
         if archive_url:
             preflight_stopped = True
@@ -1956,9 +1962,6 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
                 source=source, is_silent=is_silent and not is_interaction,
                 send_response=send_response if is_interaction else None
             )
-            continue
-        target_id = get_video_id(target_url)
-        if await is_url_excluded_globally(target_id):
             continue
         valid_tasks.append((target_url, url_type, is_silent))
 
