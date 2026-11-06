@@ -32,7 +32,7 @@ GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
 REPO_OWNER = os.getenv('GITHUB_OWNER')
 REPO_NAME = os.getenv('GITHUB_REPO')
 WORKFLOW_FILE = 't.yml'
-BOT_REQUEST_TRACE_ID = "bigdawg"
+BOT_REQUEST_TRACE_ID = "bigdawg" # Legacy trace ID and prefix for numbered requests
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN in environment variables")
@@ -75,6 +75,12 @@ YOUTUBE_COOKIE_SECRETS = {
 
 class YouTubeCookiesUnavailable(Exception):
     """Keep the request queued until an eligible cookie secret is available"""
+
+
+def is_bot_trace_id(trace_id):
+    return trace_id == BOT_REQUEST_TRACE_ID or bool(re.fullmatch(
+        rf"{re.escape(BOT_REQUEST_TRACE_ID)}-[0-9]+", trace_id or ""
+    ))
 
 
 def format_archive_complete(icon, status_text, archive_url, trace_id=None):
@@ -125,13 +131,17 @@ class ArchiveBot(discord.Client):
         self.active_jobs = defaultdict(int)
         self.queued_jobs = defaultdict(list)
         self.pending_traces = {} # trace_id -> context
+        self.starting_jobs = {} # trace_id -> job reserved by the queue dispatcher
+        self.dispatch_tasks = set()
+        self.bot_trace_counter = 0
         self.batch_jobs = {} # batch_id -> aggregate multi-link context
-        self.bot_trace_lock = asyncio.Lock()
         self.cookie_lock = asyncio.Lock()
         self.state_lock = asyncio.Lock()
         self.disabled_cookies = {}
         self.cookie_secret_versions = {}
         self.cookie_metadata_loaded = False
+        self.cookie_status_error = None
+        self.github_poll_error = None
         self.shutdown_requested = False
 
     async def setup_hook(self):
@@ -141,8 +151,7 @@ class ArchiveBot(discord.Client):
         await init_excluded_db()
         await remove_expired_global_exclusions()
         await self.load_state()
-        if BOT_REQUEST_TRACE_ID in self.pending_traces and not self.bot_trace_lock.locked():
-            await self.bot_trace_lock.acquire()
+        await self.restore_bot_trace_counter()
         await self.tree.sync()
         upload_logs.start()
         poll_github_runs.start()
@@ -150,6 +159,21 @@ class ArchiveBot(discord.Client):
         cleanup_expired_exclusions.start()
         self.update_bot_status.start()
         logging.info("Commands synced, DB initialized, Session active, Log upload task started, Github polling started, exclusion cleanup started")
+
+    def next_bot_trace_id(self):
+        # The dispatcher checkpoints this counter before sending the request.
+        self.bot_trace_counter += 1
+        return f"{BOT_REQUEST_TRACE_ID}-{self.bot_trace_counter:02d}"
+
+    async def restore_bot_trace_counter(self):
+        # History also prevents reuse if a state checkpoint is missing/older.
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute(
+                "SELECT MAX(CAST(SUBSTR(trace_id, ?) AS INTEGER)) FROM history WHERE trace_id GLOB ?",
+                (len(BOT_REQUEST_TRACE_ID) + 2, f"{BOT_REQUEST_TRACE_ID}-[0-9]*")
+            ) as cursor:
+                row = await cursor.fetchone()
+        self.bot_trace_counter = max(self.bot_trace_counter, (row[0] if row else None) or 0)
 
     async def on_ready(self):
         print(f'Logged in as {self.user}!')
@@ -215,6 +239,7 @@ class ArchiveBot(discord.Client):
         """Save the current state of pending traces and queued jobs to a file"""
         logging.info("Saving state")
         state = {
+            "bot_trace_counter": self.bot_trace_counter,
             "pending_traces": {},
             "queued_jobs": {},
             "active_jobs": dict(self.active_jobs),
@@ -259,8 +284,14 @@ class ArchiveBot(discord.Client):
                 } if context["status_msg"] else None
             }
 
+        # A process can stop during preflight/dispatch. Save those reservations
+        # as queued work too, instead of restoring a count with no matching job.
+        jobs_to_save = {uid: list(jobs) for uid, jobs in self.queued_jobs.items()}
+        for job in reversed(list(self.starting_jobs.values())):
+            jobs_to_save.setdefault(job[5], []).insert(0, job)
+
         # Serialize queued_jobs
-        for user_id, jobs in self.queued_jobs.items():
+        for user_id, jobs in jobs_to_save.items():
             serialized_jobs = []
             for job in jobs:
                 # job: (target_url, url_type, is_silent, original_message,
@@ -316,9 +347,12 @@ class ArchiveBot(discord.Client):
                 content = await f.read()
                 if not content: return
                 state = json.loads(content)
+            self.bot_trace_counter = max(self.bot_trace_counter, int(state.get("bot_trace_counter", 0)))
 
-            # Restore active jobs count
-            self.active_jobs = defaultdict(int, {int(k): v for k, v in state.get("active_jobs", {}).items()})
+            # Rebuild counters from actual tracked requests after restoring them.
+            # Old snapshots counted tasks waiting on the shared bot lock even
+            # though those tasks could not be resumed after a restart.
+            self.active_jobs = defaultdict(int)
 
             # Restore batch_jobs
             self.batch_jobs = {}
@@ -361,7 +395,7 @@ class ArchiveBot(discord.Client):
                     "guild_id": data.get("guild_id"),
                     "free_space": data.get("free_space", False),
                     "batch_id": data.get("batch_id"),
-                    "is_bot_request": data.get("is_bot_request", trace_id == BOT_REQUEST_TRACE_ID),
+                    "is_bot_request": data.get("is_bot_request", is_bot_trace_id(trace_id)),
                     "is_cookie_retry": data.get("is_cookie_retry", False),
                     "ignore_existing_item": data.get("ignore_existing_item", False),
                     "github_run_id": data.get("github_run_id"),
@@ -400,10 +434,17 @@ class ArchiveBot(discord.Client):
                     ))
                 self.queued_jobs[user_id] = restored_jobs
 
-            logging.info(f"State loaded: {len(self.pending_traces)} pending traces, {len(self.queued_jobs)} users in queue")
-            
-            # Remove state file after successful load to prevent loop on crash
-            os.remove(STATE_FILE)
+            for context in self.pending_traces.values():
+                self.active_jobs[context["user_id"]] += 1
+            for trace_id in self.pending_traces:
+                if is_bot_trace_id(trace_id) and trace_id != BOT_REQUEST_TRACE_ID:
+                    self.bot_trace_counter = max(self.bot_trace_counter, int(trace_id.rsplit("-", 1)[1]))
+            saved_counts = {int(k): v for k, v in state.get("active_jobs", {}).items() if v}
+            actual_counts = {uid: count for uid, count in self.active_jobs.items() if count}
+            if saved_counts != actual_counts:
+                logging.warning("Repaired stale active job counts: saved=%s restored=%s", saved_counts, actual_counts)
+            logging.info(f"State loaded: {len(self.pending_traces)} pending traces, {sum(map(len, self.queued_jobs.values()))} queued jobs")
+            # Keep the last checkpoint until the next atomic save succeeds.
 
         except Exception as e:
             logging.error(f"Failed to load state: {e}")
@@ -465,6 +506,7 @@ class ArchiveBot(discord.Client):
                         url, headers=GITHUB_HEADERS, params={"per_page": 100, "page": page}
                     ) as response:
                         if response.status != 200:
+                            self.cookie_status_error = f"Cannot read cookie secret metadata (GitHub HTTP {response.status})"
                             logging.warning(
                                 "Cannot check cookie secrets (HTTP %s), GITHUB_TOKEN needs repository "
                                 "Secrets: read permission, or repo scope for a classic PAT, "
@@ -481,6 +523,7 @@ class ArchiveBot(discord.Client):
                         break
                     page += 1
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                self.cookie_status_error = f"Cannot read cookie secret metadata: {type(exc).__name__}"
                 logging.warning("Could not check cookie secret updates: %s", exc)
                 return False
 
@@ -505,6 +548,7 @@ class ArchiveBot(discord.Client):
                 await db.commit()
             self.cookie_secret_versions = versions
             self.cookie_metadata_loaded = True
+            self.cookie_status_error = None
             return True
 
     async def choose_youtube_cookie(self):
@@ -543,7 +587,17 @@ class ArchiveBot(discord.Client):
             await self.notify_disabled_cookies()
 
     async def close(self):
+        self.shutdown_requested = True
         poll_cookie_secrets.cancel()
+        poll_github_runs.cancel()
+        cleanup_expired_exclusions.cancel()
+        upload_logs.cancel()
+        self.update_bot_status.cancel()
+        tasks_to_stop = list(self.dispatch_tasks)
+        for task in tasks_to_stop:
+            task.cancel()
+        if tasks_to_stop:
+            await asyncio.gather(*tasks_to_stop, return_exceptions=True)
         if self.session:
             await self.session.close()
         await super().close()
@@ -831,11 +885,6 @@ class ArchiveBot(discord.Client):
 
 client = ArchiveBot()
 
-def release_bot_trace_slot(context):
-    """Release the shared fixed trace ID after a bot-authored request ends"""
-    if context.get("is_bot_request") and client.bot_trace_lock.locked():
-        client.bot_trace_lock.release()
-
 async def schedule_timeout_retry(context):
     await asyncio.sleep(JOB_RETRY_DELAY_SECONDS)
 
@@ -855,117 +904,161 @@ async def schedule_timeout_retry(context):
     )
 
     client.queued_jobs[user_id].append(queued_job)
-
+    await client.save_state()
     if client.active_jobs[user_id] < MAX_CONCURRENT_JOBS:
-        await check_and_process_queue(user_id)
+        await process_all_queues()
 
 # --- GitHub Polling Task ---
+
+def workflow_run_matches(trace_id, context, run):
+    bound_run_id = context.get("github_run_id")
+    if bound_run_id:
+        return run.get("id") == bound_run_id
+    run_name = run.get("display_title") or run.get("name", "")
+    match = re.search(r'\[trace-([a-zA-Z0-9-]+)\]', run_name)
+    if not match or match.group(1) != trace_id:
+        return False
+    if context.get("is_bot_request"):
+        # Ignore older workflows, including runs using the legacy bare bigdawg.
+        try:
+            created_at = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+            if created_at.timestamp() + 5 < context["start_time"].timestamp():
+                return False
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return False
+    return True
+
+
+def archive_request_expired(context):
+    started_at = context.get("start_time")
+    if not isinstance(started_at, datetime):
+        return False
+    return datetime.now(timezone.utc).timestamp() - started_at.timestamp() > JOB_TIMEOUT_SECONDS
+
+
+def release_archive_request(trace_id, context):
+    if client.pending_traces.get(trace_id) is not context:
+        return
+    del client.pending_traces[trace_id]
+    user_id = context["user_id"]
+    client.active_jobs[user_id] = max(0, client.active_jobs[user_id] - 1)
+
+
+async def finish_archive_request(trace_id, context, run):
+    try:
+        exit_code = 0 if run.get("conclusion") == "success" else 1
+        await asyncio.wait_for(client.handle_completion(context, exit_code, trace_id), timeout=300)
+    except Exception:
+        logging.exception("Completion handling failed for trace %s, releasing its slot", trace_id)
+    finally:
+        # DB, artifact, or Discord reporting errors cannot pin a finished job.
+        release_archive_request(trace_id, context)
+        await client.save_state()
+        await process_all_queues()
+
+
+async def expire_archive_request(trace_id, context):
+    run_id = context.get("github_run_id")
+    if run_id:
+        cancel_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/actions/runs/{run_id}/cancel"
+        try:
+            async with client.session.post(cancel_url, headers=GITHUB_HEADERS) as resp:
+                if resp.status not in (202, 409):
+                    logging.warning("Could not cancel timed out run %s: HTTP %s", run_id, resp.status)
+        except Exception:
+            logging.exception("Error cancelling timed out run %s", run_id)
+
+    # Apply the deadline even to queued, waiting, missing, and unobservable runs.
+    release_archive_request(trace_id, context)
+    asyncio.create_task(schedule_timeout_retry(context))
+    await client.save_state()
+    await process_all_queues()
+    logging.warning("Timed out trace %s (last GitHub status: %s), retry in 2 hours",
+                    trace_id, context.get("github_status", "not found"))
+    try:
+        await update_history_status(context["history_run_id"], "Retrying later")
+    except Exception:
+        logging.exception("Could not update timed out history for trace %s", trace_id)
+    if not context["is_silent"] and context.get("status_msg"):
+        try:
+            await asyncio.wait_for(context["status_msg"].edit(
+                content=f"<:warning:1492123648377618582> This archive job has taken longer than 30 minutes and will be retried in about 2 hours\n\n||Trace ID: `{trace_id}`||"
+            ), timeout=30)
+        except Exception:
+            logging.warning("Could not show timeout status for trace %s", trace_id)
+
 
 @tasks.loop(seconds=15)
 async def poll_github_runs():
     if not client.pending_traces:
+        await process_all_queues()
         return
-        
+
     runs_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/actions/workflows/{WORKFLOW_FILE}/runs"
+    runs = []
     try:
-        async with client.session.get(runs_url, headers=GITHUB_HEADERS, params={"per_page": 100}) as resp:
-            if resp.status == 200:
+        # Search older pages for requests that have not yet been bound to a run.
+        # Already-bound requests also have a direct run-ID lookup below.
+        for page in range(1, 11):
+            async with client.session.get(runs_url, headers=GITHUB_HEADERS,
+                                          params={"per_page": 100, "page": page}) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"Workflow listing returned GitHub HTTP {resp.status}")
                 data = await resp.json()
-                for run in data.get("workflow_runs", []):
-                    run_name = run.get("display_title") or run.get("name", "")
-                    run_status = run.get("status")
-                    conclusion = run.get("conclusion")
-                    
-                    match = re.search(r'\[trace-([a-zA-Z0-9-]+)\]', run_name)
-                    if match:
-                        trace_id = match.group(1)
-                        if trace_id in client.pending_traces:
-                            context = client.pending_traces[trace_id]
+            page_runs = data.get("workflow_runs", [])
+            runs.extend(page_runs)
+            unresolved = any(
+                not context.get("github_run_id")
+                and not any(workflow_run_matches(trace_id, context, run) for run in runs)
+                for trace_id, context in list(client.pending_traces.items())
+            )
+            if not unresolved or len(page_runs) < 100:
+                break
+        client.github_poll_error = None
+    except Exception as exc:
+        client.github_poll_error = str(exc) or type(exc).__name__
+        logging.warning("Error listing GitHub runs: %s", client.github_poll_error)
 
-                            # Bot-authored requests intentionally reuse the
-                            # fixed trace ID "bigdawg", ignore older workflow
-                            # runs with that same name and bind this request to
-                            # the first current run we observe
-                            if context.get("is_bot_request"):
-                                run_id = run.get("id")
-                                bound_run_id = context.get("github_run_id")
-                                if bound_run_id and run_id != bound_run_id:
-                                    continue
+    for trace_id, context in list(client.pending_traces.items()):
+        try:
+            run = next((run for run in runs if workflow_run_matches(trace_id, context, run)), None)
+            if run is None and context.get("github_run_id"):
+                run_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/actions/runs/{context['github_run_id']}"
+                try:
+                    async with client.session.get(run_url, headers=GITHUB_HEADERS) as resp:
+                        if resp.status == 200:
+                            run = await resp.json()
+                        else:
+                            client.github_poll_error = f"Run lookup returned GitHub HTTP {resp.status}"
+                            logging.warning("Cannot read run for trace %s: HTTP %s", trace_id, resp.status)
+                except Exception as exc:
+                    client.github_poll_error = str(exc) or type(exc).__name__
+                    logging.warning("Cannot read run for trace %s: %s", trace_id, exc)
 
-                                created_at = run.get("created_at")
-                                started_at = context.get("start_time")
-                                if isinstance(created_at, str) and isinstance(started_at, datetime):
-                                    try:
-                                        run_created_at = datetime.fromisoformat(
-                                            created_at.replace("Z", "+00:00")
-                                        )
-                                        if run_created_at.timestamp() + 5 < started_at.timestamp():
-                                            continue
-                                    except (TypeError, ValueError):
-                                        pass
+            if run is not None:
+                context["github_run_id"] = run.get("id")
+                context["github_status"] = run.get("status")
+                if run.get("status") == "completed":
+                    await finish_archive_request(trace_id, context, run)
+                    continue
 
-                                if not bound_run_id and run_status in ("queued", "in_progress"):
-                                    context["github_run_id"] = run_id
-                            
-                            if run_status == "in_progress":
-                                context["github_run_id"] = run.get("id")
-                                started_at = context.get("start_time")
-                                if isinstance(started_at, datetime):
-                                    elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
-                                    if elapsed > JOB_TIMEOUT_SECONDS and not context.get("retry_scheduled", False):
-                                        context["retry_scheduled"] = True
-                                        run_id = run.get("id")
-                                        if run_id:
-                                            cancel_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/actions/runs/{run_id}/cancel"
-                                            try:
-                                                async with client.session.post(cancel_url, headers=GITHUB_HEADERS) as cancel_resp:
-                                                    if cancel_resp.status not in (202, 409):
-                                                        cancel_text = await cancel_resp.text()
-                                                        logging.warning(f"Failed to cancel timed out run {run_id} for trace {trace_id}: {cancel_resp.status} {cancel_text}")
-                                            except Exception as cancel_err:
-                                                logging.warning(f"Error cancelling timed out run {run_id} for trace {trace_id}: {cancel_err}")
+            # The local clock decides the deadline even when GitHub is unavailable.
+            if archive_request_expired(context):
+                await expire_archive_request(trace_id, context)
+            elif run and run.get("status") == "in_progress" and not context.get("is_processing"):
+                context["is_processing"] = True
+                if not context["is_silent"] and context.get("status_msg") and not context.get("is_cookie_retry"):
+                    try:
+                        await asyncio.wait_for(context["status_msg"].edit(
+                            content=f"<a:loading:1455572437277348005> YouTube {context['url_type']} is being preserved\n\n||Trace ID: `{trace_id}`||"
+                        ), timeout=30)
+                    except Exception:
+                        pass
+        except Exception:
+            logging.exception("Error processing GitHub trace %s", trace_id)
 
-                                        await update_history_status(context["history_run_id"], "Retrying later")
-
-                                        if not context["is_silent"] and context["status_msg"]:
-                                            try:
-                                                await context["status_msg"].edit(
-                                                    content=f"<:warning:1492123648377618582> This archive job has taken longer than 30 minutes and will be retried in about 2 hours\n\n||Trace ID: `{trace_id}`||"
-                                                )
-                                            except Exception:
-                                                pass
-
-                                        user_id = context["user_id"]
-                                        del client.pending_traces[trace_id]
-                                        release_bot_trace_slot(context)
-                                        client.active_jobs[user_id] = max(0, client.active_jobs[user_id] - 1)
-                                        asyncio.create_task(schedule_timeout_retry(context))
-                                        await check_and_process_queue(user_id)
-                                        logging.info(f"Timed out trace {trace_id}, cancelled and scheduled retry in 2 hours")
-                                        continue
-
-                                if not context.get("is_processing", False):
-                                    context["is_processing"] = True
-                                    if not context["is_silent"] and context["status_msg"] and not context.get("is_cookie_retry"):
-                                        try:
-                                            await context["status_msg"].edit(content=f"<a:loading:1455572437277348005> YouTube {context['url_type']} is being preserved\n\n||Trace ID: `{trace_id}`||")
-                                        except:
-                                            pass
-                            elif run_status == "completed":
-                                exit_code = 0 if conclusion == "success" else 1
-                                context["github_run_id"] = run.get("id")
-                                
-                                await client.handle_completion(context, exit_code, trace_id)
-                                
-                                user_id = context["user_id"]
-                                del client.pending_traces[trace_id]
-                                release_bot_trace_slot(context)
-                                client.active_jobs[user_id] = max(0, client.active_jobs[user_id] - 1)
-                                await check_and_process_queue(user_id)
-                                await client.save_state()
-                                logging.info(f"Cleaned up trace {trace_id}")
-    except Exception as e:
-        logging.error(f"Error polling github runs: {e}")
+    await client.save_state()
+    await process_all_queues()
 
 @poll_github_runs.before_loop
 async def before_poll_github_runs():
@@ -977,10 +1070,7 @@ async def poll_cookie_secrets():
     try:
         await client.refresh_cookie_secrets()
         # Wake paused queues even when no archive workflow is currently running
-        if client.available_youtube_accounts():
-            for user_id in list(client.queued_jobs):
-                while client.queued_jobs[user_id] and client.active_jobs[user_id] < MAX_CONCURRENT_JOBS:
-                    await check_and_process_queue(user_id)
+        await process_all_queues()
         await client.save_state()
     except Exception as exc:
         logging.error("Error checking YouTube cookie secrets: %s", exc)
@@ -1166,7 +1256,7 @@ async def init_db():
         except Exception:
             pass
 
-        # Requests using the dedicated automated trace ID are known bot or
+        # Requests using automated trace IDs are known bot or
         # webhook jobs and can be excluded without an API lookup
         await db.execute(
             """
@@ -1174,10 +1264,10 @@ async def init_db():
                 (user_id, account_type, checked_at)
             SELECT DISTINCT user_id, 'bot', CURRENT_TIMESTAMP
             FROM history
-            WHERE trace_id = ?
+            WHERE (trace_id = ? OR trace_id GLOB ?)
               AND user_id IS NOT NULL
             """,
-            (BOT_REQUEST_TRACE_ID,)
+            (BOT_REQUEST_TRACE_ID, f"{BOT_REQUEST_TRACE_ID}-[0-9]*")
         )
         
         await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_exclusions ON exclusions(guild_id, type, value);")
@@ -1319,7 +1409,7 @@ async def log_history(guild_id, user_id, url, status, run_id, trace_id=None):
             await db.execute("INSERT INTO history (guild_id, user_id, url, status, run_id, timestamp) VALUES (?, ?, ?, ?, ?, ?)", 
                              (guild_id, user_id, url, status, run_id, utc_now))
 
-        if trace_id == BOT_REQUEST_TRACE_ID:
+        if is_bot_trace_id(trace_id):
             await db.execute(
                 """
                 INSERT INTO leaderboard_accounts
@@ -1848,7 +1938,7 @@ async def scan_and_dispatch_description_links(parent_video_id, parent_trace_id):
             client.queued_jobs[system_user_id].append(
                 (url, sub_type, True, None, None, system_user_id, True, None, True)
             )
-            await check_and_process_queue(system_user_id)
+            await process_all_queues()
             await client.save_state()
 
     except Exception as e:
@@ -1886,12 +1976,13 @@ def extract_tasks_from_text(text):
     return tasks_to_process
 
 async def complete_existing_archive(target_url, url_type, archive_url, guild_id, user_id,
-                                    source=None, is_silent=False, batch_id=None, send_response=None):
+                                    source=None, is_silent=False, batch_id=None, send_response=None,
+                                    trace_id=None):
     """Record a metadata match locally and show the normal completion sequence"""
     video_id = get_video_id(target_url)
     await add_to_global_excluded_file(video_id, get_category_for_url_type(url_type))
     await make_global_exclusion_permanent(video_id)
-    trace_id = str(uuid.uuid4())[:8]
+    trace_id = trace_id or str(uuid.uuid4())[:8]
     # No GitHub run exists, the trace identifies this local history record
     await log_history(guild_id, user_id, target_url, "Already archived", None, trace_id)
     status_msg = None
@@ -2062,6 +2153,13 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
     for target_url, url_type, is_silent in tasks_to_process:
         effective_silent = is_silent or batch_id is not None
         current_jobs = client.active_jobs[user.id]
+        wait_reason = None
+        if not client.available_youtube_accounts():
+            wait_reason = "Waiting for available YouTube cookie accounts, the request is saved"
+        elif current_jobs >= MAX_CONCURRENT_JOBS:
+            wait_reason = f"You have {current_jobs}/{MAX_CONCURRENT_JOBS} active archive requests running, please wait for one of them to finish"
+        elif client.queued_jobs[user.id]:
+            wait_reason = "Waiting for your earlier queued requests"
 
         message_for_execution = None
         
@@ -2069,55 +2167,33 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
             message_for_execution = None
         else:
             if is_interaction:
-                if current_jobs >= MAX_CONCURRENT_JOBS:
+                if wait_reason:
                     queue_pos = len(client.queued_jobs[user.id]) + 1
                     text = (
                         f"Your request for the YouTube {url_type} has been added to the queue (Position: {queue_pos})\n\n"
-                        f"||You have {current_jobs}/{MAX_CONCURRENT_JOBS} active archive requests running, please wait for one of them to finish||"
+                        f"||{wait_reason}||"
                     )
                 else:
                     text = f"Sending request to preserve YouTube {url_type}\n\n[||Target||](<{target_url}>)"
                 
                 message_for_execution = await send_response(text)
             else:
-                if current_jobs >= MAX_CONCURRENT_JOBS and not effective_silent:
+                if wait_reason and not effective_silent:
                     queue_pos = len(client.queued_jobs[user.id]) + 1
                     await source.reply(
                         f"Your request for the YouTube {url_type} has been added to the queue (Position: {queue_pos})\n\n"
-                        f"||You have {current_jobs}/{MAX_CONCURRENT_JOBS} active archive requests running, please wait for one of them to finish||",
+                        f"||{wait_reason}||",
                         delete_after=10
                     )
                 message_for_execution = source
         
-        if current_jobs >= MAX_CONCURRENT_JOBS:
-            client.queued_jobs[user.id].append(
-                (
-                    target_url,
-                    url_type,
-                    effective_silent,
-                    message_for_execution,
-                    guild_id,
-                    user.id,
-                    free_space,
-                    batch_id,
-                    is_bot_request
-                )
-            )
-            continue
-        
-        client.active_jobs[user.id] += 1
-        
-        await execute_archive_request(
-            target_url,
-            url_type,
-            effective_silent,
-            message_for_execution,
-            guild_id,
-            user.id,
-            free_space=free_space,
-            batch_id=batch_id,
-            is_bot_request=is_bot_request
-        )
+        # Every accepted request has a durable queue entry before it starts.
+        client.queued_jobs[user.id].append((
+            target_url, url_type, effective_silent, message_for_execution,
+            guild_id, user.id, free_space, batch_id, is_bot_request
+        ))
+        await client.save_state()
+        await process_all_queues()
 
 async def execute_archive_request(
     target_url,
@@ -2130,11 +2206,13 @@ async def execute_archive_request(
     batch_id=None,
     is_bot_request=False,
     is_cookie_retry=False,
-    ignore_existing_item=False
+    ignore_existing_item=False,
+    trace_id=None
 ):
     """
     Handles the actual execution: triggering workflow, updating UI, logging to DB, and starting monitor
     """
+    trace_id = trace_id or (client.next_bot_trace_id() if is_bot_request else str(uuid.uuid4())[:8])
     # Initial User Feedback (Only if not silent)
     status_msg = original_message if is_cookie_retry else None
     if not is_cookie_retry and not batch_id and not is_silent and original_message:
@@ -2150,24 +2228,15 @@ async def execute_archive_request(
     # Recheck after a queue wait or retry before cookies or dispatch
     archive_url = await check_existing_archive(target_url)
     if archive_url:
-        try:
-            await complete_existing_archive(
-                target_url, url_type, archive_url, guild_id, user_id,
-                source=status_msg or original_message, is_silent=is_silent, batch_id=batch_id
-            )
-        finally:
-            client.active_jobs[user_id] = max(0, client.active_jobs[user_id] - 1)
-            await client.save_state()
-            await check_and_process_queue(user_id)
+        await complete_existing_archive(
+            target_url, url_type, archive_url, guild_id, user_id,
+            source=status_msg or original_message, is_silent=is_silent, batch_id=batch_id,
+            trace_id=trace_id
+        )
         return
 
-    bot_trace_slot_acquired = False
-    if is_bot_request:
-        await client.bot_trace_lock.acquire()
-        bot_trace_slot_acquired = True
-
+    # The dispatcher reserves a unique trace before starting this task.
     request_started_at = datetime.now(timezone.utc)
-    trace_id = BOT_REQUEST_TRACE_ID if is_bot_request else str(uuid.uuid4())[:8]
     
     try:
         success, error, cookie_selection = await trigger_workflow(
@@ -2175,19 +2244,13 @@ async def execute_archive_request(
         )
         
         if success:
-            # Add to exclusions with specific category
-            category = get_category_for_url_type(url_type)
-            target_id = get_video_id(target_url)
-            await add_to_global_excluded_file(target_id, category)
-            
             # Use a string UUID for the run_id to avoid integer overflow
             # The history table schema expects run_id to be INTEGER, but SQLite is dynamic
             # However, to be safe and cleaner, let's use a smaller random int
             history_run_id = int(uuid.uuid4().int % (2**63 - 1))
             
-            await log_history(guild_id, user_id, target_url, "queued", history_run_id, trace_id)
-            
-            # Store context for WebSocket handler
+            # Track the accepted dispatch before any fallible DB/UI work, so
+            # an error cannot leave a running workflow holding an invisible slot.
             client.pending_traces[trace_id] = {
                 "user_id": user_id,
                 "target_url": target_url,
@@ -2205,8 +2268,13 @@ async def execute_archive_request(
                 "youtube_account": cookie_selection[0],
                 "cookie_secret_updated_at": cookie_selection[1]
             }
-            bot_trace_slot_acquired = False
+            client.starting_jobs.pop(trace_id, None)
             await client.save_state()
+
+            category = get_category_for_url_type(url_type)
+            target_id = get_video_id(target_url)
+            await add_to_global_excluded_file(target_id, category)
+            await log_history(guild_id, user_id, target_url, "queued", history_run_id, trace_id)
             
             if not is_cookie_retry and not batch_id and not is_silent and status_msg:
                 try:
@@ -2214,16 +2282,13 @@ async def execute_archive_request(
                 except:
                     pass
             
-            # No monitor_run task needed anymore, we wait for WS connection
+            # poll_github_runs owns this request until completion or timeout.
         else:
             if not is_silent and status_msg:
                 try:
                     await status_msg.edit(content=f"Error starting workflow: {error}")
                 except:
                     pass
-            # If failed to start, we must manually decrement here
-            client.active_jobs[user_id] = max(0, client.active_jobs[user_id] - 1)
-            await check_and_process_queue(user_id)
             if batch_id:
                 await client.update_batch_progress(batch_id, is_success=False)
 
@@ -2233,8 +2298,6 @@ async def execute_archive_request(
             target_url, url_type, is_silent, status_msg or original_message, guild_id, user_id,
             free_space, batch_id, is_bot_request, is_cookie_retry, ignore_existing_item
         ))
-        client.active_jobs[user_id] = max(0, client.active_jobs[user_id] - 1)
-        await client.save_state()
     except Exception as e:
         logging.error(f"Critical error in processing {target_url}: {e}")
         if not is_silent and status_msg:
@@ -2243,34 +2306,54 @@ async def execute_archive_request(
             except:
                 pass
         
-        client.active_jobs[user_id] = max(0, client.active_jobs[user_id] - 1)
-        await check_and_process_queue(user_id)
-        if batch_id:
+        if batch_id and trace_id not in client.pending_traces:
             await client.update_batch_progress(batch_id, is_success=False)
+
+
+async def run_reserved_archive_job(trace_id, job):
+    """Release a reservation exactly once unless a workflow now owns it."""
+    try:
+        await client.save_state()
+        await execute_archive_request(*job, trace_id=trace_id)
+    except asyncio.CancelledError:
+        if client.starting_jobs.get(trace_id) is job:
+            client.queued_jobs[job[5]].insert(0, job)
+        raise
+    except Exception:
+        logging.exception("Archive dispatch task failed for %s", job[0])
+        if len(job) > 7 and job[7] and client.starting_jobs.get(trace_id) is job:
+            await client.update_batch_progress(job[7], is_success=False)
     finally:
-        if bot_trace_slot_acquired and client.bot_trace_lock.locked():
-            client.bot_trace_lock.release()
+        # A workflow may already have completed while its dispatch task was
+        # still reporting to Discord. Only release a reservation we still own.
+        if client.starting_jobs.get(trace_id) is job:
+            del client.starting_jobs[trace_id]
+            client.active_jobs[job[5]] = max(0, client.active_jobs[job[5]] - 1)
+        await client.save_state()
+        await process_all_queues()
 
 async def check_and_process_queue(user_id):
-    """Checks if there are queued jobs for the user and starts the next one"""
-    if not client.available_youtube_accounts() or client.active_jobs[user_id] >= MAX_CONCURRENT_JOBS:
-        return
-    if client.queued_jobs[user_id]:
+    """Reserve capacity and give each bot request its own numbered trace."""
+    started = 0
+    while (not client.shutdown_requested and client.available_youtube_accounts()
+           and client.active_jobs[user_id] < MAX_CONCURRENT_JOBS
+           and client.queued_jobs[user_id]):
+        next_job = client.queued_jobs[user_id][0]
+        is_bot_request = len(next_job) > 8 and next_job[8]
         next_job = client.queued_jobs[user_id].pop(0)
-        # Increment active_jobs immediately so the slot is taken
+        trace_id = client.next_bot_trace_id() if is_bot_request else str(uuid.uuid4())[:8]
+        client.starting_jobs[trace_id] = next_job
         client.active_jobs[user_id] += 1
-        
-        # Unpack and run
-        # job format: (target_url, url_type, is_silent, original_message, guild_id, user_id)
-        # Note: execute_archive_request takes user_id as last arg, but it's in the tuple
-        
-        # Notify user their queued job is starting (optional, but good UX if not silent)
-        if not next_job[2] and next_job[3]: # is_silent, original_message
-             # We don't necessarily need to edit the old "queued" message, 
-             # execute_archive_request reuses an existing status message when one is available
-             pass
+        task = asyncio.create_task(run_reserved_archive_job(trace_id, next_job))
+        client.dispatch_tasks.add(task)
+        task.add_done_callback(client.dispatch_tasks.discard)
+        started += 1
+    return started
 
-        asyncio.create_task(execute_archive_request(*next_job))
+
+async def process_all_queues():
+    for user_id in list(client.queued_jobs):
+        await check_and_process_queue(user_id)
 
 # --- Pagination View ---
 
@@ -2635,30 +2718,39 @@ async def archive_cmd(interaction: discord.Interaction, url: str, free_space: bo
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(f"Pong! `{round(client.latency*1000)}ms`", ephemeral=False)
 
-@client.tree.command(name="jobs", description="List every user with a currently active job")
+@client.tree.command(name="jobs", description="Show active jobs, queued requests, and queue blockers (BOT OWNER ONLY)")
 async def jobs(interaction: discord.Interaction):
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("You are not authorized to use this command", ephemeral=True)
         return
     
     active_users = {uid: count for uid, count in client.active_jobs.items() if count > 0}
-    if not active_users:
-        await interaction.response.send_message("No active jobs right now")
-        return
-        
-    embed = discord.Embed(title="Current Active Jobs", color=discord.Color.blue())
-    description = []
-    for uid, count in active_users.items():
-        user = client.get_user(uid)
-        if not user:
-            try:
-                user = await client.fetch_user(uid)
-            except discord.NotFound:
-                pass
-        username_str = f" ({user.name})" if user else ""
-        description.append(f"<@{uid}>{username_str} ({count} active jobs)")
-        
-    embed.description = "\n".join(description)
+    queued_users = {uid: len(queue) for uid, queue in client.queued_jobs.items() if queue}
+    embed = discord.Embed(title="Archive Queue Status", color=discord.Color.blue())
+    lines = [f"<@{uid}>: {active_users.get(uid, 0)} active, {queued_users.get(uid, 0)} queued"
+             for uid in sorted(set(active_users) | set(queued_users))]
+    embed.description = ("\n".join(lines)[:3900] if lines else "No active or queued jobs right now")
+    available = client.available_youtube_accounts()
+    cookie_text = f"{len(available)}/{len(YOUTUBE_COOKIE_SECRETS)} accounts available"
+    if not available:
+        if not client.cookie_metadata_loaded:
+            cookie_text += "\nQueue paused until cookie secret metadata can be read"
+        else:
+            cookie_text += "\nQueue paused, cookie secrets are missing or disabled"
+    if client.cookie_status_error:
+        cookie_text += f"\n{client.cookie_status_error}\nCheck GITHUB_TOKEN repository Secrets read permission"
+    embed.add_field(name="YouTube cookies", value=cookie_text[:1024], inline=False)
+    bot_traces = [(trace_id, context) for trace_id, context in client.pending_traces.items()
+                  if context.get("is_bot_request") or is_bot_trace_id(trace_id)]
+    if bot_traces:
+        bot_lines = [f"`{trace_id}`: {context.get('github_status', 'awaiting run match')}"
+                     for trace_id, context in bot_traces[:10]]
+        if len(bot_traces) > 10:
+            bot_lines.append(f"And {len(bot_traces) - 10} more")
+        embed.add_field(name="Active bot requests", value="\n".join(bot_lines)[:1024], inline=False)
+    if client.github_poll_error:
+        embed.add_field(name="GitHub polling error", value=client.github_poll_error[:1024], inline=False)
+    embed.set_footer(text=f"{sum(active_users.values())} active, {sum(queued_users.values())} queued, {len(client.starting_jobs)} starting")
     await interaction.response.send_message(embed=embed)
 
 @client.tree.command(name="howmanyjobs", description="Show a user's archive jobs count")
