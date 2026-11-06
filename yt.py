@@ -133,6 +133,14 @@ class ArchiveBot(discord.Client):
         self.pending_traces = {} # trace_id -> context
         self.starting_jobs = {} # trace_id -> job reserved by the queue dispatcher
         self.dispatch_tasks = set()
+        self.dispatch_task_details = {}
+        self.dispatch_phases = {}
+        self.cancel_lock = asyncio.Lock()
+        self.cancelling_all = False
+        self.cancelling_users = set()
+        self.cancel_epoch = 0
+        self.user_cancel_epochs = defaultdict(int)
+        self.delayed_retry_jobs = {}
         self.bot_trace_counter = 0
         self.batch_jobs = {} # batch_id -> aggregate multi-link context
         self.cookie_lock = asyncio.Lock()
@@ -151,7 +159,9 @@ class ArchiveBot(discord.Client):
         await init_excluded_db()
         await remove_expired_global_exclusions()
         await self.load_state()
+        logging.info("Restoring bot trace counter from history")
         await self.restore_bot_trace_counter()
+        logging.info("Syncing Discord commands")
         await self.tree.sync()
         upload_logs.start()
         poll_github_runs.start()
@@ -164,6 +174,12 @@ class ArchiveBot(discord.Client):
         # The dispatcher checkpoints this counter before sending the request.
         self.bot_trace_counter += 1
         return f"{BOT_REQUEST_TRACE_ID}-{self.bot_trace_counter:02d}"
+
+    def job_generation(self, user_id):
+        return self.cancel_epoch, self.user_cancel_epochs[user_id]
+
+    def queue_is_paused(self, user_id):
+        return self.cancelling_all or user_id in self.cancelling_users
 
     async def restore_bot_trace_counter(self):
         # History also prevents reuse if a state checkpoint is missing/older.
@@ -274,6 +290,8 @@ class ArchiveBot(discord.Client):
                 "is_bot_request": context.get("is_bot_request", False),
                 "is_cookie_retry": context.get("is_cookie_retry", False),
                 "ignore_existing_item": context.get("ignore_existing_item", False),
+                "cancel_requested": context.get("cancel_requested", False),
+                "cancel_acknowledged": context.get("cancel_acknowledged", False),
                 "github_run_id": context.get("github_run_id"),
                 "youtube_account": context.get("youtube_account"),
                 "cookie_secret_updated_at": context.get("cookie_secret_updated_at"),
@@ -336,6 +354,19 @@ class ArchiveBot(discord.Client):
         except Exception as e:
             logging.error(f"Failed to save state: {e}")
 
+    def restore_message_reference(self, data):
+        """Rebuild a usable message reference without fetching Discord history."""
+        if not data:
+            return None
+        try:
+            channel_id, message_id = int(data["channel_id"]), int(data["message_id"])
+            if channel_id <= 0 or message_id <= 0:
+                raise ValueError("Discord IDs must be positive")
+            return self.get_partial_messageable(channel_id).get_partial_message(message_id)
+        except (KeyError, TypeError, ValueError) as error:
+            logging.warning("Could not restore a saved Discord message reference: %s", error)
+            return None
+
     async def load_state(self):
         """Load the state from the file and restore objects"""
         if not os.path.exists(STATE_FILE):
@@ -348,6 +379,11 @@ class ArchiveBot(discord.Client):
                 if not content: return
                 state = json.loads(content)
             self.bot_trace_counter = max(self.bot_trace_counter, int(state.get("bot_trace_counter", 0)))
+            logging.info(
+                "Restoring %s batches, %s pending traces, and %s queued jobs using saved Discord message IDs",
+                len(state.get("batch_jobs", {})), len(state.get("pending_traces", {})),
+                sum(len(jobs) for jobs in state.get("queued_jobs", {}).values())
+            )
 
             # Rebuild counters from actual tracked requests after restoring them.
             # Old snapshots counted tasks waiting on the shared bot lock even
@@ -357,14 +393,7 @@ class ArchiveBot(discord.Client):
             # Restore batch_jobs
             self.batch_jobs = {}
             for batch_id, bdata in state.get("batch_jobs", {}).items():
-                status_msg = None
-                if bdata.get("status_msg_data"):
-                    try:
-                        channel = self.get_channel(bdata["status_msg_data"]["channel_id"]) or await self.fetch_channel(bdata["status_msg_data"]["channel_id"])
-                        if channel:
-                            status_msg = await channel.fetch_message(bdata["status_msg_data"]["message_id"])
-                    except Exception as e:
-                        logging.warning(f"Could not restore status message for batch {batch_id}: {e}")
+                status_msg = self.restore_message_reference(bdata.get("status_msg_data"))
                 self.batch_jobs[batch_id] = {
                     "total": bdata["total"],
                     "completed": bdata["completed"],
@@ -376,14 +405,7 @@ class ArchiveBot(discord.Client):
 
             # Restore pending_traces
             for trace_id, data in state.get("pending_traces", {}).items():
-                status_msg = None
-                if data.get("status_msg_data"):
-                    try:
-                        channel = self.get_channel(data["status_msg_data"]["channel_id"]) or await self.fetch_channel(data["status_msg_data"]["channel_id"])
-                        if channel:
-                            status_msg = await channel.fetch_message(data["status_msg_data"]["message_id"])
-                    except Exception as e:
-                        logging.warning(f"Could not restore status message for trace {trace_id}: {e}")
+                status_msg = self.restore_message_reference(data.get("status_msg_data"))
 
                 self.pending_traces[trace_id] = {
                     "user_id": data["user_id"],
@@ -398,6 +420,8 @@ class ArchiveBot(discord.Client):
                     "is_bot_request": data.get("is_bot_request", is_bot_trace_id(trace_id)),
                     "is_cookie_retry": data.get("is_cookie_retry", False),
                     "ignore_existing_item": data.get("ignore_existing_item", False),
+                    "cancel_requested": data.get("cancel_requested", False),
+                    "cancel_acknowledged": data.get("cancel_acknowledged", False),
                     "github_run_id": data.get("github_run_id"),
                     "youtube_account": data.get("youtube_account"),
                     "cookie_secret_updated_at": data.get("cookie_secret_updated_at"),
@@ -409,14 +433,7 @@ class ArchiveBot(discord.Client):
                 user_id = int(user_id_str)
                 restored_jobs = []
                 for job_data in jobs_data:
-                    msg = None
-                    if job_data.get("message_data"):
-                        try:
-                            channel = self.get_channel(job_data["message_data"]["channel_id"]) or await self.fetch_channel(job_data["message_data"]["channel_id"])
-                            if channel:
-                                msg = await channel.fetch_message(job_data["message_data"]["message_id"])
-                        except Exception as e:
-                            logging.warning(f"Could not restore queue message for user {user_id}: {e}")
+                    msg = self.restore_message_reference(job_data.get("message_data"))
                     
                     # Reconstruct tuple
                     restored_jobs.append((
@@ -641,6 +658,8 @@ class ArchiveBot(discord.Client):
         return None
 
     async def handle_completion(self, context, exit_code, trace_id):
+        if context.get("cancel_requested"):
+            return
         user_id = context["user_id"]
         original_url = context["target_url"]
         url_type = context["url_type"]
@@ -677,6 +696,8 @@ class ArchiveBot(discord.Client):
                     except Exception as e:
                         logging.error(f"Failed to upload artifact to log channel for trace {trace_id}: {e}")
 
+        if context.get("cancel_requested"):
+            return
         invalid_cookies = has_invalid_youtube_cookies(log_text)
         history_status = "Archived" if exit_code == 0 and not invalid_cookies else "Failed"
         if actual_run_id:
@@ -695,6 +716,8 @@ class ArchiveBot(discord.Client):
                 await self.disable_youtube_cookie(
                     account, context.get("cookie_secret_updated_at"), actual_run_id, trace_id
                 )
+                if context.get("cancel_requested"):
+                    return
                 self.queued_jobs[user_id].insert(0, (
                     original_url, url_type, is_silent, status_msg, context.get("guild_id"), user_id,
                     context.get("free_space", False), batch_id, context.get("is_bot_request", False), True,
@@ -767,9 +790,11 @@ class ArchiveBot(discord.Client):
             except Exception as e:
                 logging.error(f"Failed to set one-hour exclusion expiry for {video_id}: {e}")
 
-        if archive_succeeded:
+        if archive_succeeded and not context.get("cancel_requested"):
             if video_id and url_type in ["Video", "Short", "Live"]:
-                asyncio.create_task(scan_and_dispatch_description_links(video_id, trace_id))
+                asyncio.create_task(scan_and_dispatch_description_links(
+                    video_id, trace_id, user_id, client.job_generation(user_id)
+                ))
 
         archive_urls = []
         if log_text and not is_already_archived:
@@ -885,9 +910,31 @@ class ArchiveBot(discord.Client):
 
 client = ArchiveBot()
 
-async def schedule_timeout_retry(context):
-    await asyncio.sleep(JOB_RETRY_DELAY_SECONDS)
+def schedule_timeout_retry(context):
+    """Register immediately so /cancelalljobs also catches timers not yet started."""
+    user_id = context["user_id"]
+    retry_id = uuid.uuid4().hex
+    generation = client.job_generation(user_id)
+    record = {"context": context, "task": None}
+    if not context.get("cancel_requested"):
+        client.delayed_retry_jobs[retry_id] = record
 
+    async def wait_and_resume():
+        record["task"] = asyncio.current_task()
+        try:
+            if retry_id not in client.delayed_retry_jobs or context.get("cancel_requested"):
+                return
+            await asyncio.sleep(JOB_RETRY_DELAY_SECONDS)
+            if (retry_id not in client.delayed_retry_jobs or context.get("cancel_requested")
+                    or generation != client.job_generation(user_id)):
+                return
+            await enqueue_timeout_retry(context)
+        finally:
+            client.delayed_retry_jobs.pop(retry_id, None)
+    return wait_and_resume()
+
+
+async def enqueue_timeout_retry(context):
     user_id = context["user_id"]
     queued_job = (
         context["target_url"],
@@ -958,6 +1005,8 @@ async def finish_archive_request(trace_id, context, run):
 
 
 async def expire_archive_request(trace_id, context):
+    if context.get("cancel_requested"):
+        return
     run_id = context.get("github_run_id")
     if run_id:
         cancel_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/actions/runs/{run_id}/cancel"
@@ -968,6 +1017,8 @@ async def expire_archive_request(trace_id, context):
         except Exception:
             logging.exception("Error cancelling timed out run %s", run_id)
 
+    if context.get("cancel_requested"):
+        return
     # Apply the deadline even to queued, waiting, missing, and unobservable runs.
     release_archive_request(trace_id, context)
     asyncio.create_task(schedule_timeout_retry(context))
@@ -1021,6 +1072,8 @@ async def poll_github_runs():
 
     for trace_id, context in list(client.pending_traces.items()):
         try:
+            if client.pending_traces.get(trace_id) is not context:
+                continue
             run = next((run for run in runs if workflow_run_matches(trace_id, context, run)), None)
             if run is None and context.get("github_run_id"):
                 run_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/actions/runs/{context['github_run_id']}"
@@ -1035,6 +1088,20 @@ async def poll_github_runs():
                     client.github_poll_error = str(exc) or type(exc).__name__
                     logging.warning("Cannot read run for trace %s: %s", trace_id, exc)
 
+            if client.pending_traces.get(trace_id) is not context:
+                continue
+            if context.get("cancel_requested"):
+                if run:
+                    context["github_run_id"] = run.get("id")
+                    context["github_status"] = run.get("status")
+                if run and run.get("status") == "completed":
+                    await finish_cancelled_request(trace_id, context, run)
+                elif run:
+                    await request_workflow_cancellation(context)
+                elif archive_request_expired(context):
+                    logging.warning("No workflow found for cancelled trace %s, releasing local tracking", trace_id)
+                    await finish_cancelled_request(trace_id, context)
+                continue
             if run is not None:
                 context["github_run_id"] = run.get("id")
                 context["github_status"] = run.get("status")
@@ -1838,8 +1905,11 @@ def clean_youtube_urls(text):
 
 # --- GitHub API & Archiving Logic ---
 
-async def trigger_workflow(url, trace_id, free_space=False, ignore_existing_item=False):
+async def trigger_workflow(url, trace_id, free_space=False, ignore_existing_item=False,
+                           request_user_id=None, request_generation=None):
     account, secret_updated_at = await client.choose_youtube_cookie()
+    if request_generation is not None and request_generation != client.job_generation(request_user_id):
+        return False, "Request cancelled", None
     dispatch_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/actions/workflows/{WORKFLOW_FILE}/dispatches"
     
     payload = {
@@ -1860,9 +1930,12 @@ async def trigger_workflow(url, trace_id, free_space=False, ignore_existing_item
     
     return True, None, (account, secret_updated_at)
 
-async def scan_and_dispatch_description_links(parent_video_id, parent_trace_id):
+async def scan_and_dispatch_description_links(parent_video_id, parent_trace_id,
+                                               parent_user_id=None, parent_generation=None):
     if not parent_video_id:
         return
+    parent_user_id = parent_user_id if parent_user_id is not None else client.user.id
+    parent_generation = parent_generation or client.job_generation(parent_user_id)
 
     item_identifier = f"youtube-{parent_video_id}"
     metadata_url = f"https://archive.org/metadata/{item_identifier}"
@@ -1902,6 +1975,8 @@ async def scan_and_dispatch_description_links(parent_video_id, parent_trace_id):
                     unique_links.add((clean_url, new_video_id))
 
         for git_url in git_links:
+            if parent_generation != client.job_generation(parent_user_id):
+                return
             trace_id = parent_trace_id
             # using 'test' as the repo name per requirements for git dispatches
             dispatch_url = f"https://api.github.com/repos/{REPO_OWNER}/test/actions/workflows/t-git.yml/dispatches"
@@ -1917,6 +1992,8 @@ async def scan_and_dispatch_description_links(parent_video_id, parent_trace_id):
                 logging.error(f"Failed to auto-dispatch git link {git_url}: {e}")
 
         for url, vid_id in unique_links:
+            if parent_generation != client.job_generation(parent_user_id):
+                return
             try:
                 if await check_existing_archive(url):
                     continue
@@ -1931,6 +2008,8 @@ async def scan_and_dispatch_description_links(parent_video_id, parent_trace_id):
             sub_type = determine_url_type(url)
             sub_cat = get_category_for_url_type(sub_type)
             await add_to_global_excluded_file(vid_id, sub_cat)
+            if parent_generation != client.job_generation(parent_user_id):
+                return
             
             # Description links need the same cookie selection, failure detection,
             # and silent retries as ordinary requests, rather than an untracked POST
@@ -2011,6 +2090,7 @@ async def complete_existing_archive(target_url, url_type, archive_url, guild_id,
 
 
 async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_space):
+    generation = client.job_generation(user.id)
     is_interaction = isinstance(source, discord.Interaction)
     is_dm = guild_id is None
     is_bot_request = bool(getattr(user, "bot", False))
@@ -2151,6 +2231,10 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
         }
 
     for target_url, url_type, is_silent in tasks_to_process:
+        if generation != client.job_generation(user.id):
+            if batch_id:
+                client.batch_jobs.pop(batch_id, None)
+            return
         effective_silent = is_silent or batch_id is not None
         current_jobs = client.active_jobs[user.id]
         wait_reason = None
@@ -2188,6 +2272,10 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
                 message_for_execution = source
         
         # Every accepted request has a durable queue entry before it starts.
+        if generation != client.job_generation(user.id):
+            if batch_id:
+                client.batch_jobs.pop(batch_id, None)
+            return
         client.queued_jobs[user.id].append((
             target_url, url_type, effective_silent, message_for_execution,
             guild_id, user.id, free_space, batch_id, is_bot_request
@@ -2212,6 +2300,7 @@ async def execute_archive_request(
     """
     Handles the actual execution: triggering workflow, updating UI, logging to DB, and starting monitor
     """
+    generation = client.job_generation(user_id)
     trace_id = trace_id or (client.next_bot_trace_id() if is_bot_request else str(uuid.uuid4())[:8])
     # Initial User Feedback (Only if not silent)
     status_msg = original_message if is_cookie_retry else None
@@ -2222,11 +2311,15 @@ async def execute_archive_request(
                 await status_msg.edit(content=f"Sending request to preserve YouTube {url_type}\n\n[||Target||](<{target_url}>)")
             else:
                 status_msg = await original_message.reply(f"Sending request to preserve YouTube {url_type}\n\n[||Target||](<{target_url}>)")
-        except:
+        except asyncio.CancelledError:
+            raise
+        except Exception:
             pass
 
     # Recheck after a queue wait or retry before cookies or dispatch
     archive_url = await check_existing_archive(target_url)
+    if generation != client.job_generation(user_id):
+        return
     if archive_url:
         await complete_existing_archive(
             target_url, url_type, archive_url, guild_id, user_id,
@@ -2239,8 +2332,10 @@ async def execute_archive_request(
     request_started_at = datetime.now(timezone.utc)
     
     try:
+        client.dispatch_phases[trace_id] = "dispatching"
         success, error, cookie_selection = await trigger_workflow(
-            target_url, trace_id, free_space=free_space, ignore_existing_item=ignore_existing_item
+            target_url, trace_id, free_space=free_space, ignore_existing_item=ignore_existing_item,
+            request_user_id=user_id, request_generation=generation
         )
         
         if success:
@@ -2268,8 +2363,13 @@ async def execute_archive_request(
                 "youtube_account": cookie_selection[0],
                 "cookie_secret_updated_at": cookie_selection[1]
             }
+            if generation != client.job_generation(user_id):
+                client.pending_traces[trace_id]["cancel_requested"] = True
             client.starting_jobs.pop(trace_id, None)
             await client.save_state()
+
+            if client.pending_traces[trace_id].get("cancel_requested"):
+                return
 
             category = get_category_for_url_type(url_type)
             target_id = get_video_id(target_url)
@@ -2293,6 +2393,8 @@ async def execute_archive_request(
                 await client.update_batch_progress(batch_id, is_success=False)
 
     except YouTubeCookiesUnavailable:
+        if generation != client.job_generation(user_id):
+            return
         # Preserve the original message and batch silently while all cookies wait
         client.queued_jobs[user_id].append((
             target_url, url_type, is_silent, status_msg or original_message, guild_id, user_id,
@@ -2316,7 +2418,7 @@ async def run_reserved_archive_job(trace_id, job):
         await client.save_state()
         await execute_archive_request(*job, trace_id=trace_id)
     except asyncio.CancelledError:
-        if client.starting_jobs.get(trace_id) is job:
+        if client.starting_jobs.get(trace_id) is job and not client.queue_is_paused(job[5]):
             client.queued_jobs[job[5]].insert(0, job)
         raise
     except Exception:
@@ -2324,6 +2426,7 @@ async def run_reserved_archive_job(trace_id, job):
         if len(job) > 7 and job[7] and client.starting_jobs.get(trace_id) is job:
             await client.update_batch_progress(job[7], is_success=False)
     finally:
+        client.dispatch_phases.pop(trace_id, None)
         # A workflow may already have completed while its dispatch task was
         # still reporting to Discord. Only release a reservation we still own.
         if client.starting_jobs.get(trace_id) is job:
@@ -2335,7 +2438,7 @@ async def run_reserved_archive_job(trace_id, job):
 async def check_and_process_queue(user_id):
     """Reserve capacity and give each bot request its own numbered trace."""
     started = 0
-    while (not client.shutdown_requested and client.available_youtube_accounts()
+    while (not client.shutdown_requested and not client.queue_is_paused(user_id) and client.available_youtube_accounts()
            and client.active_jobs[user_id] < MAX_CONCURRENT_JOBS
            and client.queued_jobs[user_id]):
         next_job = client.queued_jobs[user_id][0]
@@ -2346,7 +2449,11 @@ async def check_and_process_queue(user_id):
         client.active_jobs[user_id] += 1
         task = asyncio.create_task(run_reserved_archive_job(trace_id, next_job))
         client.dispatch_tasks.add(task)
-        task.add_done_callback(client.dispatch_tasks.discard)
+        client.dispatch_task_details[task] = (trace_id, next_job)
+        def finished(done):
+            client.dispatch_tasks.discard(done)
+            client.dispatch_task_details.pop(done, None)
+        task.add_done_callback(finished)
         started += 1
     return started
 
@@ -2354,6 +2461,138 @@ async def check_and_process_queue(user_id):
 async def process_all_queues():
     for user_id in list(client.queued_jobs):
         await check_and_process_queue(user_id)
+
+
+async def request_workflow_cancellation(context):
+    run_id = context.get("github_run_id")
+    if not run_id:
+        return False
+    if context.get("cancel_acknowledged"):
+        return True
+    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/actions/runs/{run_id}/cancel"
+    try:
+        async with client.session.post(url, headers=GITHUB_HEADERS) as response:
+            if response.status == 202:
+                context["cancel_acknowledged"] = True
+                return True
+            logging.warning("Cancellation for run %s returned HTTP %s, polling will check again", run_id, response.status)
+    except Exception:
+        logging.exception("Could not request cancellation for run %s", run_id)
+    return False
+
+
+async def finish_cancelled_request(trace_id, context, run=None):
+    release_archive_request(trace_id, context)
+    status = "Archived" if run and run.get("conclusion") == "success" else "Cancelled"
+    run_id = context.get("github_run_id")
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                "UPDATE history SET status = ?, run_id = COALESCE(?, run_id) "
+                "WHERE run_id IN (?, ?) AND status NOT IN ('Archived', 'Already archived')",
+                (status, run_id, context.get("history_run_id"), run_id)
+            )
+            await db.commit()
+    except Exception:
+        logging.exception("Could not record cancelled trace %s", trace_id)
+    if not context.get("is_silent") and context.get("status_msg"):
+        try:
+            await asyncio.wait_for(context["status_msg"].edit(
+                content=(f"Archive {'finished before cancellation' if status == 'Archived' else 'request cancelled by the bot owner'}"
+                         f"\n\n||Trace ID: `{trace_id}`||")
+            ), timeout=10)
+        except Exception:
+            logging.warning("Could not update cancellation message for trace %s", trace_id)
+    await client.save_state()
+
+
+async def cancel_archive_jobs(target_user_id=None):
+    """Discard the selected backlog and keep live runs tracked until they stop."""
+    workflow_cancel = getattr(client, "_workflow_cancel_retries", None)
+    if getattr(client, "_workflow_hooks_installed", False) and workflow_cancel is None:
+        raise RuntimeError("Update the hosting workflow too, so saved delayed retries can be cancelled")
+    async with client.cancel_lock:
+        matches = lambda uid: target_user_id is None or uid == target_user_id
+        if target_user_id is None:
+            client.cancelling_all = True
+            client.cancel_epoch += 1
+        else:
+            client.cancelling_users.add(target_user_id)
+            client.user_cancel_epochs[target_user_id] += 1
+        result = {"queued_removed":0, "retries_removed":0, "inflight_selected":0,
+                  "github_accepted":0, "github_waiting":0}
+        batch_ids = set()
+        try:
+            for uid in list(client.queued_jobs):
+                if matches(uid):
+                    old_jobs = client.queued_jobs[uid]
+                    client.queued_jobs[uid] = []
+                    result["queued_removed"] += len(old_jobs)
+                    batch_ids.update(job[7] for job in old_jobs if len(job) > 7 and job[7])
+            selected_traces = set()
+            for trace_id, context in list(client.pending_traces.items()):
+                if matches(context["user_id"]):
+                    context["cancel_requested"] = True
+                    selected_traces.add(trace_id)
+                    if context.get("batch_id"):
+                        batch_ids.add(context["batch_id"])
+            reservations = {trace:job for trace, job in client.starting_jobs.items() if matches(job[5])}
+            selected_traces.update(reservations)
+            batch_ids.update(job[7] for job in reservations.values() if len(job) > 7 and job[7])
+
+            timers_to_stop = []
+            for retry_id, record in list(client.delayed_retry_jobs.items()):
+                if matches(record["context"]["user_id"]):
+                    del client.delayed_retry_jobs[retry_id]
+                    result["retries_removed"] += 1
+                    context = record["context"]
+                    context["cancel_requested"] = True
+                    if context.get("batch_id"):
+                        batch_ids.add(context["batch_id"])
+                    if record.get("task") is not None:
+                        record["task"].cancel()
+                        timers_to_stop.append(record["task"])
+            if workflow_cancel is not None:
+                cleared = await workflow_cancel(target_user_id)
+                result["retries_removed"] += cleared["removed"]
+                batch_ids.update(cleared["batch_ids"])
+            if timers_to_stop:
+                await asyncio.gather(*timers_to_stop, return_exceptions=True)
+
+            dispatches = [(task, trace, job) for task, (trace, job) in list(client.dispatch_task_details.items())
+                          if trace in reservations]
+            for task, trace, job in dispatches:
+                if client.dispatch_phases.get(trace) != "dispatching":
+                    task.cancel()
+            # Let an HTTP dispatch already in progress finish. Its generation
+            # check marks an accepted run for cancellation instead of losing it.
+            if dispatches:
+                await asyncio.gather(*(task for task, _, _ in dispatches), return_exceptions=True)
+            for trace, job in reservations.items():
+                if client.starting_jobs.get(trace) is job:
+                    del client.starting_jobs[trace]
+                    client.active_jobs[job[5]] = max(0, client.active_jobs[job[5]] - 1)
+            for batch_id in batch_ids:
+                client.batch_jobs.pop(batch_id, None)
+            contexts = [context for context in client.pending_traces.values()
+                        if matches(context["user_id"]) and context.get("cancel_requested")]
+            semaphore = asyncio.Semaphore(4)
+            async def cancel_one(context):
+                async with semaphore:
+                    return await request_workflow_cancellation(context)
+            acknowledgements = await asyncio.gather(*(cancel_one(context) for context in contexts))
+            result["inflight_selected"] = len(selected_traces)
+            result["github_accepted"] = sum(acknowledgements)
+            result["github_waiting"] = len(contexts) - result["github_accepted"]
+            await client.save_state()
+            logging.info("Owner cancelled archive jobs for %s: %s", target_user_id or "all users", result)
+            return result
+        finally:
+            if target_user_id is None:
+                client.cancelling_all = False
+            else:
+                client.cancelling_users.discard(target_user_id)
+            await process_all_queues()
 
 # --- Pagination View ---
 
@@ -2902,6 +3141,37 @@ async def traceinfo(interaction: discord.Interaction, trace_id: str):
     embed.add_field(name="Batch ID", value=str(context.get('batch_id', 'None')), inline=True)
     
     await interaction.response.send_message(embed=embed)
+
+@client.tree.command(name="cancelalljobs", description="Cancel queued, retrying, and active archive jobs (BOT OWNER ONLY)")
+@app_commands.describe(user_id="Optional Discord user/bot ID or mention, leave blank to cancel everyone's jobs")
+async def cancelalljobs(interaction: discord.Interaction, user_id: str = None):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("You are not authorized to use this command", ephemeral=True)
+        return
+    target_user_id = None
+    if user_id is not None:
+        target_user_id = parse_discord_user_id(user_id)
+        if target_user_id is None:
+            await interaction.response.send_message("Enter a 17-20 digit user/bot ID or paste a user mention", ephemeral=True)
+            return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        result = await cancel_archive_jobs(target_user_id)
+    except Exception as error:
+        logging.exception("Could not cancel archive jobs")
+        await interaction.followup.send(f"Could not finish cancelling jobs: {error}", ephemeral=True)
+        return
+    scope = f"user/bot `{target_user_id}`" if target_user_id is not None else "all users and bots"
+    text = (f"Cancellation requested for {scope}\n"
+            f"Queued requests removed: {result['queued_removed']}\n"
+            f"Scheduled retries removed: {result['retries_removed']}\n"
+            f"Active/starting requests selected: {result['inflight_selected']}\n"
+            f"GitHub cancellation requests accepted: {result['github_accepted']}")
+    if result["github_waiting"]:
+        text += f"\nAwaiting run discovery or a successful GitHub cancellation request: {result['github_waiting']}"
+    text += "\nNew requests remain enabled, completed archives and history are kept"
+    await interaction.followup.send(text, ephemeral=True)
+
 
 @client.tree.command(name="restart", description="Restart the bot (BOT OWNER ONLY)")
 async def restart(interaction: discord.Interaction):
