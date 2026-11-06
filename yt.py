@@ -1971,6 +1971,10 @@ async def scan_and_dispatch_description_links(parent_video_id, parent_trace_id,
             res = clean_youtube_url(cleaned_raw)
             if res:
                 clean_url, new_video_id = res
+                # Description scans follow individual videos, not collections.
+                if (determine_url_type(clean_url) not in ("Video", "Short", "Live")
+                        or "list" in parse_qs(urlparse(clean_url).query)):
+                    continue
                 if new_video_id and new_video_id != parent_video_id:
                     unique_links.add((clean_url, new_video_id))
 
@@ -2300,6 +2304,11 @@ async def execute_archive_request(
     """
     Handles the actual execution: triggering workflow, updating UI, logging to DB, and starting monitor
     """
+    # Also discard collection links that older description scans left queued.
+    if (is_bot_request and user_id == client.user.id
+            and (url_type in ("Channel", "Playlist") or "list" in parse_qs(urlparse(target_url).query))):
+        logging.info("Skipping queued description %s link: %s", url_type, target_url)
+        return
     generation = client.job_generation(user_id)
     trace_id = trace_id or (client.next_bot_trace_id() if is_bot_request else str(uuid.uuid4())[:8])
     # Initial User Feedback (Only if not silent)
