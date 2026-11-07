@@ -836,6 +836,9 @@ class ArchiveBot(discord.Client):
             elif log_text and "Please reduce your request rate." in log_text:
                 icon = "<:wrong:1455628187127120068>"
                 status_text = f"This {url_type} has been rejected by the Internet Archive"
+            elif log_text and "requested format is not available" in log_text.casefold():
+                icon = "<:wrong:1455628187127120068>"
+                status_text = f"Unable to download YouTube {url_type}"
             elif log_text and "video unavailable" in log_text.casefold():
                 icon = "<:wrong:1455628187127120068>"
                 status_text = "Video unavailable"
