@@ -16,7 +16,7 @@ import json
 import sys
 import random
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import unescape
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
 from dotenv import load_dotenv
@@ -1230,6 +1230,7 @@ async def init_db():
         await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("PRAGMA synchronous=NORMAL;")
         await db.execute("PRAGMA busy_timeout=5000;")
+        await db.execute("BEGIN IMMEDIATE")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS disabled_youtube_cookies (
                 account INTEGER PRIMARY KEY,
@@ -1248,7 +1249,9 @@ async def init_db():
                 type TEXT NOT NULL,
                 value TEXT NOT NULL,
                 added_by TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                reason TEXT,
+                expires_at INTEGER
             )
         """)
         
@@ -1269,9 +1272,19 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER UNIQUE,
                 added_by TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                reason TEXT,
+                expires_at INTEGER
             )
         """)
+
+        for table in ("exclusions", "global_user_exclusions"):
+            async with db.execute(f"PRAGMA table_info({table})") as cursor:
+                columns = {row[1] for row in await cursor.fetchall()}
+            if "reason" not in columns:
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN reason TEXT")
+            if "expires_at" not in columns:
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN expires_at INTEGER")
 
         # Keep successful lifetime totals separate from history so users can
         # clear /history without losing their leaderboard progress, run_id
@@ -1348,17 +1361,24 @@ async def init_db():
         
         await db.commit()
 
-async def add_exclusion(guild_id, e_type, value, added_by):
+async def add_exclusion(guild_id, e_type, value, added_by, *, reason=None, expires_at=None):
     async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT 1 FROM exclusions WHERE guild_id = ? AND type = ? AND value = ?", (guild_id, e_type, str(value)))
-        if await cursor.fetchone():
-            return False
-        
-        utc_now = datetime.now(timezone.utc).isoformat()
-        await db.execute("INSERT INTO exclusions (guild_id, type, value, added_by, timestamp) VALUES (?, ?, ?, ?, ?)", 
-                         (guild_id, e_type, str(value), str(added_by), utc_now))
+        now = datetime.now(timezone.utc)
+        cursor = await db.execute(
+            """
+            INSERT INTO exclusions (guild_id, type, value, added_by, timestamp, reason, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, type, value) DO UPDATE SET
+                added_by = excluded.added_by,
+                timestamp = excluded.timestamp,
+                reason = excluded.reason,
+                expires_at = excluded.expires_at
+            WHERE exclusions.expires_at <= ?
+            """,
+            (guild_id, e_type, str(value), str(added_by), now.isoformat(), reason, expires_at, int(now.timestamp())),
+        )
         await db.commit()
-        return True
+        return cursor.rowcount > 0
 
 async def remove_exclusion(guild_id, e_type, value):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -1366,19 +1386,22 @@ async def remove_exclusion(guild_id, e_type, value):
         await db.commit()
         return cursor.rowcount > 0
 
-async def is_user_or_channel_excluded(user_id, channel_id, guild_id):
+async def get_user_or_channel_exclusion(user_id, channel_id, guild_id):
     async with aiosqlite.connect(DB_NAME) as db:
         query = """
-            SELECT 1 FROM exclusions
+            SELECT type, reason, expires_at FROM exclusions
             WHERE guild_id = ?
+            AND (expires_at IS NULL OR expires_at > ?)
             AND (
                 (type='user' AND value=?)
                 OR (type='channel' AND value=?)
             )
+            ORDER BY CASE type WHEN 'user' THEN 0 ELSE 1 END
             LIMIT 1
         """
-        async with db.execute(query, (guild_id, str(user_id), str(channel_id))) as cursor:
-            return await cursor.fetchone() is not None
+        now = int(datetime.now(timezone.utc).timestamp())
+        async with db.execute(query, (guild_id, now, str(user_id), str(channel_id))) as cursor:
+            return await cursor.fetchone()
 
 async def is_url_type_excluded(guild_id, url_type):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -1386,17 +1409,24 @@ async def is_url_type_excluded(guild_id, url_type):
         async with db.execute(query, (guild_id, str(url_type))) as cursor:
             return await cursor.fetchone() is not None
 
-async def add_global_user_exclusion(user_id, added_by):
+async def add_global_user_exclusion(user_id, added_by, *, reason=None, expires_at=None):
     async with aiosqlite.connect(DB_NAME) as db:
-        try:
-            await db.execute(
-                "INSERT INTO global_user_exclusions (user_id, added_by) VALUES (?, ?)",
-                (user_id, str(added_by))
-            )
-            await db.commit()
-            return True
-        except aiosqlite.IntegrityError:
-            return False
+        now = datetime.now(timezone.utc)
+        cursor = await db.execute(
+            """
+            INSERT INTO global_user_exclusions (user_id, added_by, timestamp, reason, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                added_by = excluded.added_by,
+                timestamp = excluded.timestamp,
+                reason = excluded.reason,
+                expires_at = excluded.expires_at
+            WHERE global_user_exclusions.expires_at <= ?
+            """,
+            (user_id, str(added_by), now.isoformat(), reason, expires_at, int(now.timestamp())),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
 
 async def remove_global_user_exclusion(user_id):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -1407,26 +1437,31 @@ async def remove_global_user_exclusion(user_id):
         await db.commit()
         return cursor.rowcount > 0
 
-async def is_user_globally_excluded(user_id):
+async def get_global_user_exclusion(user_id):
     async with aiosqlite.connect(DB_NAME) as db:
+        now = int(datetime.now(timezone.utc).timestamp())
         async with db.execute(
-            "SELECT 1 FROM global_user_exclusions WHERE user_id = ?",
-            (user_id,)
+            "SELECT reason, expires_at FROM global_user_exclusions WHERE user_id = ? AND (expires_at IS NULL OR expires_at > ?)",
+            (user_id, now)
         ) as cursor:
-            return await cursor.fetchone() is not None
+            return await cursor.fetchone()
 
 async def set_allow_bot_messages(guild_id, added_by):
     """Enable processing of bot messages with YouTube URLs in a server"""
     async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT 1 FROM exclusions WHERE guild_id = ? AND type = 'allow_bot_messages'", (guild_id,))
-        if await cursor.fetchone():
-            return False  # Already enabled
-        
         utc_now = datetime.now(timezone.utc).isoformat()
-        await db.execute("INSERT INTO exclusions (guild_id, type, value, added_by, timestamp) VALUES (?, ?, ?, ?, ?)", 
-                         (guild_id, 'allow_bot_messages', 'enabled', str(added_by), utc_now))
+        cursor = await db.execute(
+            """
+            INSERT INTO exclusions (guild_id, type, value, added_by, timestamp)
+            SELECT ?, 'allow_bot_messages', 'enabled', ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM exclusions WHERE guild_id = ? AND type = 'allow_bot_messages'
+            )
+            """,
+            (guild_id, str(added_by), utc_now, guild_id),
+        )
         await db.commit()
-        return True
+        return cursor.rowcount > 0
 
 async def unset_allow_bot_messages(guild_id):
     """Disable processing of bot messages with YouTube URLs in a server"""
@@ -2096,24 +2131,47 @@ async def complete_existing_archive(target_url, url_type, archive_url, guild_id,
         await client.update_batch_progress(batch_id, is_success=True, archive_urls=[archive_url])
 
 
-async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_space):
+async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_space, *, from_text_command=False):
     generation = client.job_generation(user.id)
     is_interaction = isinstance(source, discord.Interaction)
     is_dm = guild_id is None
     is_bot_request = bool(getattr(user, "bot", False))
 
-    async def send_response(text, ephemeral=False, suppress_embeds=False):
+    async def send_response(text, ephemeral=False, suppress_embeds=False, **message_options):
         if source.response.is_done():
-            return await source.followup.send(text, ephemeral=ephemeral, wait=True, suppress_embeds=suppress_embeds)
-        await source.response.send_message(text, ephemeral=ephemeral, suppress_embeds=suppress_embeds)
+            return await source.followup.send(
+                text, ephemeral=ephemeral, wait=True, suppress_embeds=suppress_embeds, **message_options,
+            )
+        await source.response.send_message(
+            text, ephemeral=ephemeral, suppress_embeds=suppress_embeds, **message_options,
+        )
         return await source.original_response()
 
-    if await is_user_globally_excluded(user.id):
+    denial = None
+    global_ban = await get_global_user_exclusion(user.id)
+    if global_ban is not None:
+        denial = format_ban_message("You are globally banned from using this bot", *global_ban)
+    elif not is_dm:
+        exclusion = await get_user_or_channel_exclusion(user.id, source.channel.id, guild_id)
+        if exclusion is not None:
+            exclusion_type, reason, expires_at = exclusion
+            if exclusion_type == "user":
+                denial = format_ban_message("You are banned from archiving in this server", reason, expires_at)
+            else:
+                denial = "Archiving is disabled in this channel"
+
+    if denial:
+        allowed_mentions = discord.AllowedMentions.none()
         if is_interaction:
-            await send_response(
-                "You are globally banned from using this bot",
-                ephemeral=True
-            )
+            await send_response(denial, ephemeral=True, allowed_mentions=allowed_mentions)
+        elif from_text_command and not is_bot_request:
+            if is_dm:
+                await source.reply(denial, mention_author=False, allowed_mentions=allowed_mentions)
+            else:
+                try:
+                    await user.send(denial, allowed_mentions=allowed_mentions)
+                except discord.Forbidden:
+                    await source.reply("Use `/archive` to view your restriction privately", mention_author=False)
         return
 
     # Acknowledge slash commands before network I/O, no archive request is sent
@@ -2780,16 +2838,61 @@ async def unexclude_channel(interaction: discord.Interaction, channel: discord.T
     else:
         await interaction.response.send_message("Channel was not excluded", ephemeral=True)
 
+def parse_ban_options(reason, duration):
+    reason = (reason or "").strip() or None
+    if reason and len(reason) > 500:
+        raise ValueError("Use a reason of 500 characters or fewer")
+    if duration is None:
+        return reason, None
+
+    match = re.fullmatch(r"([0-9]{1,9})\s*([smhdw])", duration.strip().lower())
+    if not match or int(match[1]) == 0:
+        raise ValueError("Enter a positive duration such as `30m`, `2h`, or `7d`")
+    seconds_per_unit = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    seconds = int(match[1]) * seconds_per_unit[match[2]]
+    try:
+        expiry = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    except OverflowError as error:
+        raise ValueError("Enter a shorter duration") from error
+    return reason, int(expiry.timestamp())
+
+
+def format_ban_message(message, reason, expires_at):
+    if expires_at is None:
+        message += " permanently"
+    else:
+        message += f" until <t:{expires_at}:F> (<t:{expires_at}:R>)"
+    if reason:
+        message += f"\nReason “{discord.utils.escape_markdown(reason)}”"
+    return message
+
+
 @client.tree.command(name="excludeuser", description="Add user to exclusion")
+@app_commands.describe(
+    reason="Optional reason for the ban",
+    duration="Optional duration like 30m, 2h, or 7d. Omit for a permanent ban",
+)
 @app_commands.checks.has_permissions(ban_members=True)
-async def exclude_user(interaction: discord.Interaction, user: discord.User):
+async def exclude_user(interaction: discord.Interaction, user: discord.User, reason: str = None, duration: str = None):
     if not interaction.guild:
         await interaction.response.send_message("This command can only be used in a server", ephemeral=True)
         return
 
-    success = await add_exclusion(interaction.guild.id, "user", user.id, interaction.user.name)
+    try:
+        reason, expires_at = parse_ban_options(reason, duration)
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+
+    success = await add_exclusion(
+        interaction.guild.id, "user", user.id, interaction.user.name, reason=reason, expires_at=expires_at,
+    )
     if success:
-        await interaction.response.send_message(f"User ID `{user.id}` added to exclusion", ephemeral=True)
+        await interaction.response.send_message(
+            format_ban_message(f"User ID `{user.id}` excluded from this server", reason, expires_at),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
     else:
         await interaction.response.send_message("User already present in exclusion", ephemeral=True)
 
@@ -2814,8 +2917,12 @@ def parse_discord_user_id(value: str):
     return int(match.group(1) or match.group(2))
 
 @client.tree.command(name="globalexcludeuser", description="Globally exclude a user by Discord ID")
-@app_commands.describe(user_id="The raw Discord user ID or a copied user mention")
-async def global_exclude(interaction: discord.Interaction, user_id: str):
+@app_commands.describe(
+    user_id="The raw Discord user ID or a copied user mention",
+    reason="Optional reason for the ban",
+    duration="Optional duration like 30m, 2h, or 7d. Omit for a permanent ban",
+)
+async def global_exclude(interaction: discord.Interaction, user_id: str, reason: str = None, duration: str = None):
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("You are not authorized to use this command", ephemeral=True)
         return
@@ -2828,10 +2935,17 @@ async def global_exclude(interaction: discord.Interaction, user_id: str):
         )
         return
 
-    if await add_global_user_exclusion(target_user_id, interaction.user.name):
+    try:
+        reason, expires_at = parse_ban_options(reason, duration)
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+
+    if await add_global_user_exclusion(target_user_id, interaction.user.name, reason=reason, expires_at=expires_at):
         await interaction.response.send_message(
-            f"User ID `{target_user_id}` has been globally excluded",
-            ephemeral=True
+            format_ban_message(f"User ID `{target_user_id}` globally excluded", reason, expires_at),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
     else:
         await interaction.response.send_message(
@@ -2865,42 +2979,62 @@ async def global_unexclude(interaction: discord.Interaction, user_id: str):
             ephemeral=True
         )
 
-@client.tree.command(name="allowbotmessages", description="Allow other bots' messages with YouTube URLs to trigger archive requests (BOT OWNER ONLY)")
-async def allow_bot_messages(interaction: discord.Interaction):
-    if not interaction.guild or interaction.guild.id != 1228824233224966276:
-        await interaction.response.send_message("This command can only be used in the designated server", ephemeral=True)
-        return
+def resolve_bot_message_server(interaction, server_id):
+    if server_id is None:
+        if interaction.guild:
+            return interaction.guild.id
+        raise ValueError("Enter a server ID when using this command in DMs")
+
+    server_id = server_id.strip()
+    if not re.fullmatch(r"[0-9]{17,20}", server_id) or not 0 < int(server_id) < 2**63:
+        raise ValueError("Enter a valid Discord server ID")
+    return int(server_id)
+
+
+@client.tree.command(name="allowbotmessages", description="Allow bot messages to trigger archives in a server (BOT OWNER ONLY)")
+@app_commands.describe(server_id="Optional Discord server ID. Uses the current server when omitted")
+async def allow_bot_messages(interaction: discord.Interaction, server_id: str = None):
 
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("Only the bot owner can use this command", ephemeral=True)
         return
 
-    success = await set_allow_bot_messages(interaction.guild.id, interaction.user.name)
+    try:
+        guild_id = resolve_bot_message_server(interaction, server_id)
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+
+    success = await set_allow_bot_messages(guild_id, interaction.user.name)
     
     if success:
         await interaction.response.send_message(
-            "Bot messages with YouTube URLs will now trigger archive requests in this server",
+            f"Bot messages can now trigger archive requests in server `{guild_id}`",
             ephemeral=True
         )
     else:
-        await interaction.response.send_message("Bot messages are already allowed in this server", ephemeral=True)
+        await interaction.response.send_message(f"Bot messages are already allowed in server `{guild_id}`", ephemeral=True)
 
-@client.tree.command(name="disallowbotmessages", description="Stop allowing other bots' messages to trigger archive requests (BOT OWNER ONLY)")
-async def disallow_bot_messages(interaction: discord.Interaction):
-    if not interaction.guild or interaction.guild.id != 1228824233224966276:
-        await interaction.response.send_message("This command can only be used in the designated server", ephemeral=True)
-        return
+@client.tree.command(name="disallowbotmessages", description="Disable archiving from bot messages in a server (BOT OWNER ONLY)")
+@app_commands.describe(server_id="Optional Discord server ID. Uses the current server when omitted")
+async def disallow_bot_messages(interaction: discord.Interaction, server_id: str = None):
 
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("Only the bot owner can use this command", ephemeral=True)
         return
 
-    success = await unset_allow_bot_messages(interaction.guild.id)
+    try:
+        guild_id = resolve_bot_message_server(interaction, server_id)
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+
+    success = await unset_allow_bot_messages(guild_id)
     
     if success:
-        await interaction.response.send_message("Bot messages will no longer trigger archive requests in this server", ephemeral=True)
+        await interaction.response.send_message(f"Disabled archiving from bot messages in server `{guild_id}`", ephemeral=True)
     else:
-        await interaction.response.send_message("Bot messages were already not allowed in this server", ephemeral=True)
+        await interaction.response.send_message(f"Archiving from bot messages is already disabled in server `{guild_id}`", ephemeral=True)
 
 @client.tree.command(name="history", description="Query your archive history logs")
 async def history(interaction: discord.Interaction):
@@ -2946,13 +3080,7 @@ async def disableallmessages(interaction: discord.Interaction):
 @client.tree.command(name="archive", description="Manually archive a YouTube URL")
 @app_commands.describe(url="The YouTube URL to archive", free_space="Enable free space for large videos")
 async def archive_cmd(interaction: discord.Interaction, url: str, free_space: bool = False):
-    is_dm = interaction.guild is None
     guild_id = interaction.guild.id if interaction.guild else None
-
-    if not is_dm:
-        if await is_user_or_channel_excluded(interaction.user.id, interaction.channel.id, guild_id):
-            await interaction.response.send_message("You or this channel are excluded from using the bot", ephemeral=True)
-            return
 
     if not re.fullmatch(r'https?://[^\s<>"]+', url.strip(' <>')):
         await interaction.response.send_message("Invalid YouTube URL", ephemeral=True)
@@ -3293,15 +3421,13 @@ async def on_message(message):
         if not await is_bot_messages_allowed(guild_id):
             return
 
-    if not is_dm:
-        if await is_user_or_channel_excluded(message.author.id, message.channel.id, guild_id):
-            return
-
     tasks_to_process = extract_tasks_from_text(content)
     if not tasks_to_process:
         return
 
-    await dispatch_archive_tasks(tasks_to_process, message.author, message, guild_id, free_space)
+    await dispatch_archive_tasks(
+        tasks_to_process, message.author, message, guild_id, free_space, from_text_command=has_archive_cmd,
+    )
 
 if __name__ == "__main__":
     client.run(DISCORD_TOKEN)
