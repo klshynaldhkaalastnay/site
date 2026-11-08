@@ -1701,7 +1701,11 @@ async def get_lifetime_leaderboard(user_id, limit=10):
 
 # --- URL Handling ---
 
-URL_IN_TEXT = re.compile(r'https?://[^\s<>"\x60|]+', re.IGNORECASE)
+LINK_IN_TEXT = re.compile(
+    r'\[(?:\\[^\r\n]|[^\[\]\\\r\n]|\[[^\[\]\r\n]*\])*\]\([ \t]*(?=<?https?://)'
+    r'|(?P<plain>https?://[^\s<>"\x60|]+)',
+    re.IGNORECASE,
+)
 URL_TYPE_CHOICES = [
     app_commands.Choice(name="Web or other link", value="Link"),
     app_commands.Choice(name="Direct video file", value="Video"),
@@ -1713,6 +1717,12 @@ URL_TYPE_CHOICES = [
 
 def parse_archive_url(value):
     url = value.strip()
+    if url.startswith("["):
+        prefix = LINK_IN_TEXT.match(url)
+        destination = masked_link_destination(url, prefix.end()) if prefix else None
+        if not destination or destination[1] != len(url):
+            return None
+        url = destination[0]
     if url.startswith("<") and url.endswith(">"):
         url = url[1:-1]
     if any(char.isspace() or ord(char) < 32 or char in '<>"\\' for char in url):
@@ -1779,6 +1789,30 @@ def determine_url_type(url):
     return {"video": "Video", "audio": "Audio", "image": "Image"}.get(mime.split("/", 1)[0], "File")
 
 
+def masked_link_destination(text, start):
+    if text[start] == "<":
+        match = re.match(r"<([^\s<>]+)>[ \t]*\)", text[start:])
+        return (match[1], start + match.end()) if match else None
+
+    # A closing parenthesis ends the link only outside the URL's own parentheses.
+    depth = 0
+    end = start
+    while end < len(text):
+        char = text[end]
+        if char == "\\" and text[end + 1:end + 2] in ("(", ")"):
+            end += 2
+            continue
+        if (char == ")" and depth == 0) or char.isspace() or char in '<>"\x60|\\':
+            break
+        depth += (char == "(") - (char == ")")
+        end += 1
+
+    closing = re.match(r"[ \t]*\)", text[end:])
+    if depth or not closing:
+        return None
+    return re.sub(r"\\([()])", r"\1", text[start:end]), end + closing.end()
+
+
 def extract_tasks_from_text(text):
     url = parse_archive_url(text)
     if url:
@@ -1786,9 +1820,16 @@ def extract_tasks_from_text(text):
 
     tasks = []
     seen = set()
-    for match in URL_IN_TEXT.finditer(text):
-        raw_url = match.group()
-        if not (match.start() and text[match.start() - 1] == "<"):
+    position = 0
+    while match := LINK_IN_TEXT.search(text, position):
+        position = match.end()
+        raw_url = match["plain"]
+        if raw_url is None:
+            destination = masked_link_destination(text, position)
+            if destination is None:
+                continue
+            raw_url, position = destination
+        elif not (match.start() and text[match.start() - 1] == "<"):
             raw_url = raw_url.rstrip(".,!،؛؟")
             while raw_url.endswith(")") and raw_url.count(")") > raw_url.count("("):
                 raw_url = raw_url[:-1]
@@ -1797,6 +1838,25 @@ def extract_tasks_from_text(text):
             seen.add(url)
             tasks.append((url, determine_url_type(url), False))
     return tasks
+
+
+def extract_message_archive_tasks(content, embeds):
+    text_parts = [content]
+    for embed in embeds:
+        # Automatic link previews already have their source URL in the message body.
+        if embed.type not in (None, "rich"):
+            continue
+        text_parts.extend((
+            embed.url or embed.title,
+            embed.description,
+            embed.author.url or embed.author.name,
+            embed.footer.text,
+        ))
+        for field in embed.fields:
+            text_parts.extend((field.name, field.value))
+    return list(dict.fromkeys(
+        task for text in text_parts if text for task in extract_tasks_from_text(text)
+    ))
 
 
 async def init_excluded_db():
@@ -3203,7 +3263,7 @@ async def on_message(message):
         if not await is_bot_messages_allowed(guild_id):
             return
 
-    tasks_to_process = extract_tasks_from_text(content)
+    tasks_to_process = extract_message_archive_tasks(content, message.embeds)
     if not tasks_to_process:
         return
 
