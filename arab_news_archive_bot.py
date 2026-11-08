@@ -558,7 +558,7 @@ class ArchiveBot(discord.Client):
             if not is_silent and status_msg:
                 try:
                     await status_msg.edit(
-                        content=f"<a:loading:1455572437277348005> Storage limit reached for {url_type}, retrying with large file support\n\n||Trace ID: `{trace_id}`||"
+                        content=f"⏳ Storage limit reached for {url_type}, retrying with large file support\n\n||Trace ID: `{trace_id}`||"
                     )
                 except Exception:
                     pass
@@ -579,14 +579,14 @@ class ArchiveBot(discord.Client):
             return
 
         if not is_silent and status_msg:
-            icon = "<:wrong:1455628187127120068>"
+            icon = "❌"
             status_text = f"Archive failed (Exit Code: {exit_code})"
             display_url = "Unavailable"
             if is_already_archived:
-                icon = "<:minus:1455628978584027228>"
+                icon = "➖"
                 status_text = f"{url_type} is already archived"
             elif archive_succeeded:
-                icon = "<:checkmark:1455627640974344203>"
+                icon = "✅"
                 status_text = "Archive succeeded"
             elif no_space:
                 status_text = "This download is too large"
@@ -647,7 +647,7 @@ class ArchiveBot(discord.Client):
                         )
 
                     final_batch_msg = (
-                        "<:checkmark:1455627640974344203> Archive Batch Complete\n"
+                        "✅ Archive Batch Complete\n"
                         f"Processed: {batch['total']} links\n"
                         f"Successful: {batch['success']}\n"
                         f"Failed: {batch['failed']}\n"
@@ -788,7 +788,7 @@ async def expire_archive_request(trace_id, context):
     if not context["is_silent"] and context.get("status_msg"):
         try:
             await asyncio.wait_for(context["status_msg"].edit(
-                content=f"<:warning:1492123648377618582> This archive job has taken longer than 30 minutes and will be retried in about 2 hours\n\n||Trace ID: `{trace_id}`||"
+                content=f"⚠️ This archive job has taken longer than 30 minutes and will be retried in about 2 hours\n\n||Trace ID: `{trace_id}`||"
             ), timeout=30)
         except Exception:
             logging.warning("Could not show timeout status for trace %s", trace_id)
@@ -872,7 +872,7 @@ async def poll_github_runs():
                 if not context["is_silent"] and context.get("status_msg"):
                     try:
                         await asyncio.wait_for(context["status_msg"].edit(
-                            content=f"<a:loading:1455572437277348005> This {context['url_type'].lower()} is being preserved\n\n||Trace ID: `{trace_id}`||"
+                            content=f"⏳ This {context['url_type'].lower()} is being preserved\n\n||Trace ID: `{trace_id}`||"
                         ), timeout=30)
                     except Exception:
                         pass
@@ -1679,7 +1679,7 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
 
         counts_text = ", ".join(f"{count} {pluralize(kind, count)}" for kind, count in sorted(type_counts.items()))
         batch_id = str(uuid.uuid4())[:8]
-        batch_text = f"<a:loading:1455572437277348005> Links are being preserved ({counts_text})\n\n||Batch ID: `{batch_id}`||"
+        batch_text = f"⏳ Links are being preserved ({counts_text})\n\n||Batch ID: `{batch_id}`||"
         
         if is_interaction:
             batch_status_msg = await send_response(batch_text)
@@ -1824,7 +1824,7 @@ async def execute_archive_request(
             
             if not batch_id and not is_silent and status_msg:
                 try:
-                    await status_msg.edit(content=f"<a:loading:1455572437277348005> This {url_type.lower()} is being preserved\n\n||Trace ID: `{trace_id}`||")
+                    await status_msg.edit(content=f"⏳ This {url_type.lower()} is being preserved\n\n||Trace ID: `{trace_id}`||")
                 except:
                     pass
             
