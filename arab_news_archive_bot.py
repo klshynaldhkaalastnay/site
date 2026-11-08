@@ -62,8 +62,12 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 MAX_CONCURRENT_JOBS = 4
 MAX_BOT_CONCURRENT_JOBS = 2
 MAX_QUEUED_JOBS = 4
+QUEUE_COOLDOWN_SECONDS = 5
 JOB_TIMEOUT_SECONDS = 30 * 60
+CRAWL_JOB_TIMEOUT_SECONDS = 45 * 60
 JOB_RETRY_DELAY_SECONDS = 2 * 60 * 60
+SPN_CAPTURE_COUNT = 5
+SPN_CAPTURE_INTERVAL_SECONDS = 60 * 60
 BOT_RETRY_SCHEDULE = (
     (60 * 60, "1 hour"),
     (2 * 60 * 60, "2 hours"),
@@ -107,6 +111,7 @@ class ArchiveBot(discord.Client):
         self.session = None
         self.active_jobs = defaultdict(int)
         self.queued_jobs = defaultdict(list)
+        self.queue_cooldowns = {}
         self.pending_traces = {} # trace_id -> context
         self.starting_jobs = {} # trace_id -> job reserved by the queue dispatcher
         self.dispatch_tasks = set()
@@ -119,6 +124,7 @@ class ArchiveBot(discord.Client):
         self.user_cancel_epochs = defaultdict(int)
         self.delayed_retry_jobs = {}
         self.bot_trace_counter = 0
+        self.last_crawl_second = 0
         self.batch_jobs = {} # batch_id -> aggregate multi-link context
         self.state_lock = asyncio.Lock()
         self.github_poll_error = None
@@ -145,6 +151,11 @@ class ArchiveBot(discord.Client):
         # The dispatcher checkpoints this counter before sending the request.
         self.bot_trace_counter += 1
         return f"{BOT_REQUEST_TRACE_ID}-{self.bot_trace_counter:02d}"
+
+    def next_crawl_timestamp(self):
+        now = int(datetime.now(timezone.utc).timestamp())
+        self.last_crawl_second = max(now, self.last_crawl_second + 1)
+        return datetime.fromtimestamp(self.last_crawl_second, timezone.utc).strftime("%Y%m%d%H%M%S")
 
     def job_generation(self, user_id):
         return self.cancel_epoch, self.user_cancel_epochs[user_id]
@@ -227,6 +238,7 @@ class ArchiveBot(discord.Client):
         logging.info("Saving state")
         state = {
             "bot_trace_counter": self.bot_trace_counter,
+            "last_crawl_second": self.last_crawl_second,
             "pending_traces": {},
             "queued_jobs": {},
             "active_jobs": dict(self.active_jobs),
@@ -260,6 +272,7 @@ class ArchiveBot(discord.Client):
                 "batch_id": context.get("batch_id"),
                 "is_bot_request": context.get("is_bot_request", False),
                 "bot_retry_count": context.get("bot_retry_count", 0),
+                "spn_series": context.get("spn_series"),
                 "ignore_existing_item": context.get("ignore_existing_item", False),
                 "cancel_requested": context.get("cancel_requested", False),
                 "cancel_acknowledged": context.get("cancel_acknowledged", False),
@@ -283,7 +296,7 @@ class ArchiveBot(discord.Client):
             for job in jobs:
                 # job: (target_url, url_type, is_silent, original_message,
                 #       guild_id, user_id, free_space, batch_id, is_bot_request,
-                #       reuse_status_message, ignore_existing_item, bot_retry_count)
+                #       reuse_status_message, ignore_existing_item, bot_retry_count, spn_series)
                 if len(job) == 6:
                     target_url, url_type, is_silent, msg, guild_id, uid = job
                     free_space = False
@@ -310,6 +323,7 @@ class ArchiveBot(discord.Client):
                     "reuse_status_message": bool(job[9]) if len(job) > 9 else False,
                     "ignore_existing_item": bool(job[10]) if len(job) > 10 else False,
                     "bot_retry_count": job[11] if len(job) > 11 else 0,
+                    "spn_series": job[12] if len(job) > 12 else None,
                     "message_data": {
                         "channel_id": msg.channel.id,
                         "message_id": msg.id
@@ -350,6 +364,7 @@ class ArchiveBot(discord.Client):
                 if not content: return
                 state = json.loads(content)
             self.bot_trace_counter = max(self.bot_trace_counter, int(state.get("bot_trace_counter", 0)))
+            self.last_crawl_second = max(self.last_crawl_second, int(state.get("last_crawl_second", 0)))
             logging.info(
                 "Restoring %s batches, %s pending traces, and %s queued jobs using saved Discord message IDs",
                 len(state.get("batch_jobs", {})), len(state.get("pending_traces", {})),
@@ -390,6 +405,7 @@ class ArchiveBot(discord.Client):
                     "batch_id": data.get("batch_id"),
                     "is_bot_request": data.get("is_bot_request", is_bot_trace_id(trace_id)),
                     "bot_retry_count": data.get("bot_retry_count", 0),
+                    "spn_series": data.get("spn_series"),
                     "ignore_existing_item": data.get("ignore_existing_item", False),
                     "cancel_requested": data.get("cancel_requested", False),
                     "cancel_acknowledged": data.get("cancel_acknowledged", False),
@@ -417,7 +433,8 @@ class ArchiveBot(discord.Client):
                         job_data.get("is_bot_request", False),
                         job_data.get("reuse_status_message", False),
                         job_data.get("ignore_existing_item", False),
-                        job_data.get("bot_retry_count", 0)
+                        job_data.get("bot_retry_count", 0),
+                        job_data.get("spn_series"),
                     ))
                 self.queued_jobs[user_id] = restored_jobs
 
@@ -438,6 +455,9 @@ class ArchiveBot(discord.Client):
 
     async def close(self):
         self.shutdown_requested = True
+        for timer in self.queue_cooldowns.values():
+            timer.cancel()
+        self.queue_cooldowns.clear()
         poll_github_runs.cancel()
         cleanup_expired_exclusions.cancel()
         upload_logs.cancel()
@@ -451,27 +471,37 @@ class ArchiveBot(discord.Client):
             await self.session.close()
         await super().close()
 
-    async def fetch_artifact_logs(self, run_id, trace_id):
+    async def fetch_artifact_logs(self, run_id, trace_id, *, include_archive=True, include_crawl=False):
         artifacts_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/actions/runs/{run_id}/artifacts"
-        expected_name = f"arab-news-archive-logs-{trace_id}.txt"
+        expected_names = set()
+        if include_archive:
+            expected_names.add(f"arab-news-archive-logs-{trace_id}.txt")
+        if include_crawl:
+            expected_names.add(f"arab-news-archive-crawl-logs-{trace_id}.txt")
+        downloaded = {}
         try:
             for _ in range(3):
                 async with self.session.get(artifacts_url, headers=GITHUB_HEADERS) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         for artifact in data.get("artifacts", []):
-                            if artifact["name"] == expected_name:
-                                download_url = artifact["archive_download_url"]
-                                async with self.session.get(download_url, headers=GITHUB_HEADERS) as d_resp:
-                                    if d_resp.status == 200:
-                                        log_data = await d_resp.read()
-                                        if zipfile.is_zipfile(io.BytesIO(log_data)):
-                                            with zipfile.ZipFile(io.BytesIO(log_data)) as archive:
-                                                for name in archive.namelist():
-                                                    if name.rsplit('/', 1)[-1] == expected_name:
-                                                        return archive.read(name)
-                                            continue
-                                        return log_data
+                            expected_name = artifact["name"]
+                            if expected_name not in expected_names or expected_name in downloaded:
+                                continue
+                            async with self.session.get(artifact["archive_download_url"], headers=GITHUB_HEADERS) as d_resp:
+                                if d_resp.status != 200:
+                                    continue
+                                log_data = await d_resp.read()
+                                if zipfile.is_zipfile(io.BytesIO(log_data)):
+                                    with zipfile.ZipFile(io.BytesIO(log_data)) as archive:
+                                        for name in archive.namelist():
+                                            if name.rsplit('/', 1)[-1] == expected_name:
+                                                downloaded[expected_name] = archive.read(name)
+                                                break
+                                else:
+                                    downloaded[expected_name] = log_data
+                        if downloaded.keys() == expected_names:
+                            return b'\n'.join(downloaded.values())
                 await asyncio.sleep(2)
         except Exception as e:
             logging.error(f"Failed to fetch artifact for run {run_id}: {e}")
@@ -483,13 +513,28 @@ class ArchiveBot(discord.Client):
                     raw = await response.read()
                     if zipfile.is_zipfile(io.BytesIO(raw)):
                         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-                            return b'\n'.join(archive.read(name) for name in archive.namelist() if name.endswith('.txt'))
-                    return raw
+                            raw = b'\n'.join(archive.read(name) for name in archive.namelist() if name.endswith('.txt'))
+                    return b'\n'.join([raw, *downloaded.values()])
         except Exception as exc:
             logging.warning("Could not fetch workflow log fallback for run %s: %s", run_id, exc)
-        return None
+        return b'\n'.join(downloaded.values()) or None
 
-    async def handle_completion(self, context, exit_code, trace_id, *, bot_retry_wait=None):
+    async def read_completion_log(self, context, trace_id):
+        run_id = context.get("github_run_id")
+        if not run_id:
+            return ""
+        series = context.get("spn_series")
+        save_page_now, crawl_website = website_archive_steps(series)
+        log_bytes = await self.fetch_artifact_logs(
+            run_id, trace_id, include_archive=not series or save_page_now, include_crawl=crawl_website,
+        )
+        if not log_bytes:
+            return ""
+        log_text = log_bytes.decode("utf-8", errors="replace")
+        log_text = re.sub(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', '***', log_text)
+        return '\n'.join(line.split('\r')[-1] for line in log_text.split('\n'))
+
+    async def handle_completion(self, context, exit_code, trace_id, log_text, result, *, followup=None):
         if context.get("cancel_requested"):
             return
         user_id = context["user_id"]
@@ -498,43 +543,44 @@ class ArchiveBot(discord.Client):
         status_msg = context["status_msg"]
         is_silent = context["is_silent"]
         batch_id = context.get("batch_id")
-        
-        status = "completed" if exit_code == 0 else "failed"
-        
-        actual_run_id = context.get("github_run_id")
-        # Fetch artifact logs once
-        log_bytes = None
-        log_text = ""
-        if actual_run_id:
-            log_bytes = await self.fetch_artifact_logs(actual_run_id, trace_id)
-            if log_bytes:
-                # Clean up yt-dlp carriage returns (\r) to prevent single-line logs
-                try:
-                    log_text = log_bytes.decode('utf-8', errors='replace')
-                    log_text = re.sub(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', '***', log_text)
-                    cleaned_lines = [line.split('\r')[-1] for line in log_text.split('\n')]
-                    log_bytes = '\n'.join(cleaned_lines).encode('utf-8')
-                except Exception as e:
-                    logging.warning(f"Failed to clean log bytes for trace {trace_id}: {e}")
 
-                # Send to log channel
-                log_channel = self.get_channel(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None
-                if log_channel:
-                    try:
-                        await log_channel.send(
-                            content=f"Log for trace `{trace_id}`\n(Status: {status}):",
-                            file=discord.File(fp=io.BytesIO(log_bytes), filename=f"arab_news_archive_log_{trace_id}.txt")
-                        )
-                    except Exception as e:
-                        logging.error(f"Failed to upload artifact to log channel for trace {trace_id}: {e}")
+        actual_run_id = context.get("github_run_id")
+        series = context.get("spn_series")
+        save_page_now, crawl_website = website_archive_steps(series)
+        saved, existing, skipped = result["saved"], result["existing"], result["skipped"]
+        wayback_url = result.get("wayback_url") if save_page_now else None
+        crawl_id = result.get("warc_identifier") if crawl_website else None
+        crawl_url = f"https://archive.org/details/{crawl_id}" if crawl_id else None
+        saved_to_account = result.get("my_web_archive") is True
+        if wayback_url:
+            number = series["attempt"]
+            capture = {"url": wayback_url, "my_web_archive": saved_to_account, "archive_number": number}
+            previous = next((entry for entry in series["captures"]
+                             if entry.get("archive_number") == number or entry["url"] == wayback_url), None)
+            if previous is None:
+                series["captures"].append(capture)
+            elif saved_to_account and not previous["my_web_archive"]:
+                previous.update(capture)
+        if crawl_url and crawl_url not in series["crawls"]:
+            series["crawls"].append(crawl_url)
+
+        log_channel = self.get_channel(LOG_CHANNEL_ID) if log_text and LOG_CHANNEL_ID else None
+        if log_channel:
+            status = "completed" if exit_code == 0 else "failed"
+            try:
+                await log_channel.send(
+                    content=f"Log for trace `{trace_id}`\n(Status: {status}):",
+                    file=discord.File(fp=io.BytesIO(log_text.encode("utf-8")), filename=f"arab_news_archive_log_{trace_id}.txt"),
+                )
+            except Exception as e:
+                logging.error(f"Failed to upload artifact to log channel: {e}")
 
         if context.get("cancel_requested"):
             return
-        log_lower = log_text.casefold()
-        saved, existing, skipped = parse_archive_result(log_text)
-        archive_succeeded = exit_code == 0
+        archive_succeeded = bool(wayback_url or crawl_url) if series else exit_code == 0
         is_already_archived = archive_succeeded and not saved and skipped > 0
         history_status = "Already archived" if is_already_archived else ("Archived" if archive_succeeded else "Failed")
+        bot_retry_wait = followup["wait"] if followup and followup["context"].get("bot_retry_count") else None
         if bot_retry_wait:
             history_status = "Retrying later"
         if actual_run_id:
@@ -543,6 +589,12 @@ class ArchiveBot(discord.Client):
                 await db.commit()
         else:
             await update_history_status(context["history_run_id"], history_status)
+
+        if series:
+            await self.report_spn_capture(
+                context, trace_id, wayback_url, saved_to_account, crawl_url=crawl_url, followup=followup,
+            )
+            return
 
         item_ids = list(dict.fromkeys(saved + existing))
         archive_urls = [f"https://archive.org/details/{identifier}" for identifier in item_ids]
@@ -561,6 +613,7 @@ class ArchiveBot(discord.Client):
                     logging.warning("Could not show retry status for trace %s", trace_id)
             return
 
+        log_lower = log_text.casefold()
         no_space = "no space left on device" in log_lower
         if (not archive_succeeded and no_space and not context.get("free_space", False)
                 and not context.get("is_bot_request", False)):
@@ -649,6 +702,77 @@ class ArchiveBot(discord.Client):
             except Exception as e:
                 logging.error(f"Failed to edit status message: {e}")
 
+    async def report_spn_capture(
+        self, context, trace_id, wayback_url=None, saved_to_account=False, *, crawl_url=None, followup=None,
+    ):
+        if context.get("cancel_requested"):
+            return
+        series = context["spn_series"]
+        wayback_urls = [capture["url"] for capture in series["captures"]]
+        crawl_urls = series.get("crawls", [])
+        urls = wayback_urls + crawl_urls
+        if not followup:
+            if urls:
+                try:
+                    await make_global_exclusion_permanent(
+                        archive_identifier(context["target_url"], save_page_now=True),
+                        category=f"spn-series-{series['id']}",
+                    )
+                except Exception:
+                    logging.exception("Could not keep the finished Wayback series in the exclusion list")
+            if context.get("batch_id"):
+                await self.update_batch_progress(context["batch_id"], bool(urls), urls)
+                return
+
+        status_msg = context.get("status_msg")
+        if context["is_silent"] or not status_msg:
+            return
+
+        if followup:
+            save_page_now, crawl_website = website_archive_steps(series)
+            status_lines = []
+            if save_page_now:
+                outcome = "✅ Saved" if wayback_url else "⚠️ Failed"
+                status_lines.append(f"{outcome} Wayback capture {series['attempt']}/{SPN_CAPTURE_COUNT}")
+                if wayback_url and not saved_to_account:
+                    status_lines.append("My Web Archive save unconfirmed")
+            if crawl_website:
+                outcome = "✅ Uploaded" if crawl_url else "⚠️ Failed"
+                status_lines.append(f"{outcome} WARC crawl {series.get('crawl_attempt', 1)}/{SPN_CAPTURE_COUNT}")
+            next_context = followup["context"]
+            next_step = describe_website_archive(next_context["spn_series"])
+            wait = followup["wait"]
+            retry_number = next_context["bot_retry_count"]
+            if retry_number:
+                status_lines.append(f"⏳ Retry {retry_number}/{len(BOT_RETRY_SCHEDULE)} in about {wait} · {next_step}")
+            else:
+                status_lines.append(f"⏳ Next archive in about {wait} · {next_step}")
+            text = "\n".join(status_lines)
+            display_urls = [url for url in (wayback_url, crawl_url) if url]
+        else:
+            crawl_complete = "crawls" not in series or len(crawl_urls) == SPN_CAPTURE_COUNT
+            icon = "✅" if len(wayback_urls) == SPN_CAPTURE_COUNT and crawl_complete else "⚠️"
+            text = f"{icon} Website archive finished\nWayback captures saved {len(wayback_urls)}/{SPN_CAPTURE_COUNT}"
+            if "crawls" in series:
+                text += f"\nWARC crawls uploaded {len(crawl_urls)}/{SPN_CAPTURE_COUNT}"
+            unconfirmed = sum(not capture["my_web_archive"] for capture in series["captures"])
+            if unconfirmed:
+                text += f"\nMy Web Archive saves unconfirmed for {unconfirmed} capture(s)"
+            display_urls = urls
+
+        edit_kwargs = {"embed": None}
+        if display_urls and sum(len(url) + 3 for url in display_urls) < 1600:
+            text += "\n" + "\n".join(f"<{url}>" for url in display_urls)
+        elif display_urls:
+            edit_kwargs["attachments"] = [
+                discord.File(io.BytesIO("\n".join(display_urls).encode("utf-8")), filename=f"website_archives_{trace_id}.txt")
+            ]
+        edit_kwargs["content"] = text + f"\n\n||Trace ID: `{trace_id}`||"
+        try:
+            await status_msg.edit(**edit_kwargs)
+        except Exception:
+            logging.warning("Could not show Wayback capture result for trace %s", trace_id)
+
     async def update_batch_progress(self, batch_id, is_success, archive_urls=None):
         if not batch_id:
             return
@@ -697,16 +821,80 @@ client = ArchiveBot()
 def prepare_bot_retry(context):
     count = context.get("bot_retry_count", 0)
     if (not context.get("is_bot_request") or count >= len(BOT_RETRY_SCHEDULE)
-            or context.get("cancel_requested") or client.queue_is_paused(context["user_id"])):
+            or context.get("cancel_requested")
+            or client.queue_is_paused(context["user_id"])):
         return None
     delay_seconds, wait = BOT_RETRY_SCHEDULE[count]
     return {
-        "context": {
-            **context, "free_space": True, "ignore_existing_item": True, "bot_retry_count": count + 1,
-        },
+        "context": {**context, "bot_retry_count": count + 1},
         "delay_seconds": delay_seconds,
         "wait": wait,
     }
+
+
+def website_archive_steps(series):
+    if not series:
+        return False, False
+    retry_steps = series.get("retry_steps")
+    if retry_steps:
+        return retry_steps["save_page_now"], retry_steps["crawl_website"]
+    if series.get("crawl_attempt"):
+        return False, True
+    return True, "crawls" in series and series["attempt"] == 1
+
+
+def describe_website_archive(series, retry_number=0):
+    save_page_now, crawl_website = website_archive_steps(series)
+    labels = []
+    if save_page_now:
+        labels.append(f"Wayback capture {series['attempt']}/{SPN_CAPTURE_COUNT}")
+    if crawl_website:
+        labels.append(f"WARC crawl {series.get('crawl_attempt', 1)}/{SPN_CAPTURE_COUNT}")
+    description = " and ".join(labels)
+    if retry_number:
+        description += f" · Retry {retry_number}/{len(BOT_RETRY_SCHEDULE)}"
+    return description
+
+
+def prepare_website_followup(context):
+    series = context["spn_series"]
+    if context.get("cancel_requested") or client.queue_is_paused(context["user_id"]):
+        return None
+    next_series = dict(series)
+    next_series.pop("retry_steps", None)
+    next_series.pop("crawl_timestamp", None)
+    # The stored archive numbers only advance after this archive and its retries finish.
+    if series.get("crawl_attempt"):
+        if series["crawl_attempt"] >= SPN_CAPTURE_COUNT:
+            return None
+        next_series["crawl_attempt"] += 1
+    elif series["attempt"] < SPN_CAPTURE_COUNT:
+        next_series["attempt"] += 1
+    elif "crawls" in series:
+        next_series["crawl_attempt"] = 2
+    else:
+        return None
+    return {
+        "context": {**context, "spn_series": next_series, "bot_retry_count": 0},
+        "delay_seconds": SPN_CAPTURE_INTERVAL_SECONDS,
+        "wait": "1 hour",
+    }
+
+
+def prepare_website_continuation(context, result=None):
+    series = context["spn_series"]
+    save_page_now, crawl_website = website_archive_steps(series)
+    result = result or {}
+    failed_steps = {
+        "save_page_now": save_page_now and not (result.get("wayback_url") and result.get("my_web_archive")),
+        "crawl_website": crawl_website and not result.get("warc_identifier"),
+    }
+    if any(failed_steps.values()):
+        retry = prepare_bot_retry(context)
+        if retry:
+            retry["context"]["spn_series"] = {**series, "retry_steps": failed_steps}
+            return retry
+    return prepare_website_followup(context)
 
 
 def schedule_delayed_retry(context, delay_seconds):
@@ -752,6 +940,7 @@ async def enqueue_delayed_retry(context):
         True, # reuse the existing status message
         context.get("ignore_existing_item", False),
         context.get("bot_retry_count", 0),
+        context.get("spn_series"),
     )
 
     client.queued_jobs[user_id].append(queued_job)
@@ -783,25 +972,54 @@ def archive_request_expired(context):
     started_at = context.get("start_time")
     if not isinstance(started_at, datetime):
         return False
-    return datetime.now(timezone.utc).timestamp() - started_at.timestamp() > JOB_TIMEOUT_SECONDS
+    _, crawl_website = website_archive_steps(context.get("spn_series"))
+    timeout = CRAWL_JOB_TIMEOUT_SECONDS if crawl_website else JOB_TIMEOUT_SECONDS
+    return datetime.now(timezone.utc).timestamp() - started_at.timestamp() > timeout
 
 
 def release_archive_request(trace_id, context):
     if client.pending_traces.get(trace_id) is not context:
         return
     del client.pending_traces[trace_id]
-    user_id = context["user_id"]
+    release_queue_slot(context["user_id"])
+
+
+def release_queue_slot(user_id):
     client.active_jobs[user_id] = max(0, client.active_jobs[user_id] - 1)
+    timer = client.queue_cooldowns.pop(user_id, None)
+    if timer is not None:
+        timer.cancel()
+    if client.shutdown_requested:
+        return
+
+    def resume_queue():
+        client.queue_cooldowns.pop(user_id, None)
+        if not client.shutdown_requested:
+            asyncio.create_task(check_and_process_queue(user_id))
+
+    loop = asyncio.get_running_loop()
+    client.queue_cooldowns[user_id] = loop.call_later(QUEUE_COOLDOWN_SECONDS, resume_queue)
 
 
 async def finish_archive_request(trace_id, context, run):
     conclusion = run.get("conclusion")
     exit_code = 0 if conclusion == "success" else 1
-    retry = prepare_bot_retry(context) if exit_code and conclusion != "cancelled" else None
+    try:
+        log_text = await asyncio.wait_for(client.read_completion_log(context, trace_id), timeout=180)
+    except Exception:
+        logging.exception("Could not read archive results for trace %s", trace_id)
+        log_text = ""
+    result = parse_archive_result(log_text)
+    followup = None
+    if conclusion != "cancelled":
+        if context.get("spn_series"):
+            followup = prepare_website_continuation(context, result)
+        elif exit_code:
+            followup = prepare_bot_retry(context)
     try:
         await asyncio.wait_for(
-            client.handle_completion(context, exit_code, trace_id, bot_retry_wait=retry["wait"] if retry else None),
-            timeout=300,
+            client.handle_completion(context, exit_code, trace_id, log_text, result, followup=followup),
+            timeout=120,
         )
     except Exception:
         logging.exception("Completion handling failed for trace %s, releasing its slot", trace_id)
@@ -809,8 +1027,8 @@ async def finish_archive_request(trace_id, context, run):
         # DB, artifact, or Discord reporting errors cannot pin a finished job.
         if client.pending_traces.get(trace_id) is context:
             release_archive_request(trace_id, context)
-            if retry and not context.get("cancel_requested"):
-                asyncio.create_task(schedule_delayed_retry(retry["context"], retry["delay_seconds"]))
+            if followup and not context.get("cancel_requested"):
+                asyncio.create_task(schedule_delayed_retry(followup["context"], followup["delay_seconds"]))
         await client.save_state()
         await process_all_queues()
 
@@ -829,6 +1047,11 @@ async def expire_archive_request(trace_id, context):
             logging.exception("Error cancelling timed out run %s", run_id)
 
     if context.get("cancel_requested") or client.pending_traces.get(trace_id) is not context:
+        return
+    if context.get("spn_series"):
+        # The other job in the initial pair may have published its result already.
+        logging.warning("Timed out website archive %s", trace_id)
+        await finish_archive_request(trace_id, context, {"conclusion": "timed_out"})
         return
     # Apply the deadline even to queued, waiting, missing, and unobservable runs.
     is_bot_request = context.get("is_bot_request", False)
@@ -938,9 +1161,13 @@ async def poll_github_runs():
             elif run and run.get("status") == "in_progress" and not context.get("is_processing"):
                 context["is_processing"] = True
                 if not context["is_silent"] and context.get("status_msg"):
+                    description = f"This {context['url_type'].lower()} is being preserved"
+                    if context.get("spn_series"):
+                        website = describe_website_archive(context["spn_series"], context.get("bot_retry_count", 0))
+                        description = f"In progress · {website}"
                     try:
                         await asyncio.wait_for(context["status_msg"].edit(
-                            content=f"⏳ This {context['url_type'].lower()} is being preserved\n\n||Trace ID: `{trace_id}`||"
+                            content=f"⏳ {description}\n\n||Trace ID: `{trace_id}`||"
                         ), timeout=30)
                     except Exception:
                         pass
@@ -1500,13 +1727,16 @@ def parse_archive_url(value):
     return None
 
 
-def archive_identifier(url):
-    return "arab-news-" + sha256(url.strip().encode("utf-8")).hexdigest()
+def archive_identifier(url, *, save_page_now=False):
+    prefix = "arab-news-spn-" if save_page_now else "arab-news-"
+    return prefix + sha256(url.strip().encode("utf-8")).hexdigest()
 
 
 def parse_archive_result(log_text):
     result_pattern = re.compile(r"^(?:\d{4}-\d{2}-\d{2}T\S+\s+)?Archive result: (\{.*\})$")
     identifier_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
+    parsed = {"saved": [], "existing": [], "skipped": 0}
+    media_found = False
     for line in reversed(log_text.splitlines()):
         match = result_pattern.fullmatch(line.strip())
         if not match:
@@ -1515,14 +1745,31 @@ def parse_archive_result(log_text):
             result = json.loads(match[1])
         except json.JSONDecodeError:
             continue
+        if not isinstance(result, dict):
+            continue
+        if "warc_identifier" in result:
+            identifier = result["warc_identifier"]
+            if isinstance(identifier, str) and identifier_pattern.fullmatch(identifier):
+                parsed.setdefault("warc_identifier", identifier)
+            continue
+        if "wayback_url" in result:
+            wayback_url = result["wayback_url"]
+            if ("wayback_url" not in parsed and isinstance(wayback_url, str)
+                    and re.fullmatch(r'https://web\.archive\.org/web/[0-9]{14}/https?://[^\s<>"\x60|]+', wayback_url, re.I)):
+                parsed.update(wayback_url=wayback_url, my_web_archive=result.get("my_web_archive") is True)
+            continue
+        if media_found:
+            continue
         saved = result.get("saved", [])
         existing = result.get("existing", [])
         skipped = result.get("skipped", 0)
         if not (isinstance(saved, list) and isinstance(existing, list) and isinstance(skipped, int)):
             continue
-        if skipped >= 0 and all(isinstance(key, str) and identifier_pattern.fullmatch(key) for key in saved + existing):
-            return saved, existing, skipped
-    return [], [], 0
+        if skipped < 0 or not all(isinstance(key, str) and identifier_pattern.fullmatch(key) for key in saved + existing):
+            continue
+        parsed.update(saved=saved, existing=existing, skipped=skipped)
+        media_found = True
+    return parsed
 
 
 def determine_url_type(url):
@@ -1573,7 +1820,38 @@ async def init_excluded_db():
             CREATE INDEX IF NOT EXISTS idx_excluded_expires_at
             ON excluded(expires_at)
         """)
+        await db.execute("CREATE TABLE IF NOT EXISTS spn_urls (url TEXT PRIMARY KEY)")
         await db.commit()
+
+
+async def get_spn_urls():
+    async with aiosqlite.connect(EXCLUDED_DB_NAME) as db:
+        async with db.execute("SELECT url FROM spn_urls") as cursor:
+            return {row[0] for row in await cursor.fetchall()}
+
+
+async def set_spn_url(url, enabled):
+    statement = "INSERT OR IGNORE INTO spn_urls (url) VALUES (?)" if enabled else "DELETE FROM spn_urls WHERE url = ?"
+    async with aiosqlite.connect(EXCLUDED_DB_NAME) as db:
+        cursor = await db.execute(statement, (url,))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def claim_spn_series(url, series_id):
+    # Allow a persisted series to continue while preventing concurrent series for the same URL.
+    archive_key = archive_identifier(url, save_page_now=True)
+    await remove_expired_global_exclusions(archive_key)
+    expiry_modifier = f"+{STANDARD_EXCLUSION_RETENTION_DAYS} days"
+    async with aiosqlite.connect(EXCLUDED_DB_NAME) as db:
+        cursor = await db.execute("""
+            INSERT INTO excluded AS current_exclusion (video_id, category, expires_at)
+            VALUES (?, ?, datetime('now', ?))
+            ON CONFLICT(video_id) DO UPDATE SET expires_at = excluded.expires_at
+            WHERE current_exclusion.category = excluded.category AND current_exclusion.expires_at IS NOT NULL
+        """, (archive_key, f"spn-series-{series_id}", expiry_modifier))
+        await db.commit()
+        return cursor.rowcount > 0
 
 async def is_url_excluded_globally(archive_key):
     if not archive_key:
@@ -1599,7 +1877,7 @@ async def add_to_global_excluded_file(archive_key, category):
         """, (archive_key, category, expiry_modifier, expiry_modifier))
         await db.commit()
 
-async def make_global_exclusion_permanent(archive_key):
+async def make_global_exclusion_permanent(archive_key, *, category=None):
     if not archive_key:
         return False
 
@@ -1607,8 +1885,8 @@ async def make_global_exclusion_permanent(archive_key):
         cursor = await db.execute("""
             UPDATE excluded
             SET expires_at = NULL
-            WHERE video_id = ?
-        """, (archive_key,))
+            WHERE video_id = ? AND (? IS NULL OR category = ?)
+        """, (archive_key, category, category))
         await db.commit()
         return cursor.rowcount > 0
 
@@ -1641,7 +1919,8 @@ async def remove_from_global_excluded_file(archive_key):
 # --- GitHub API & Archiving Logic ---
 
 async def trigger_workflow(url, trace_id, free_space=False, ignore_existing_item=False,
-                           request_user_id=None, request_generation=None):
+                           request_user_id=None, request_generation=None, *,
+                           save_page_now=False, crawl_website=False, ia_identifier=None, crawl_timestamp=None):
     if request_generation is not None and request_generation != client.job_generation(request_user_id):
         return False, "Request cancelled"
     dispatch_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/actions/workflows/{WORKFLOW_FILE}/dispatches"
@@ -1654,6 +1933,14 @@ async def trigger_workflow(url, trace_id, free_space=False, ignore_existing_item
             "ignore_existing_item": str(ignore_existing_item).lower(),
         },
     }
+    if save_page_now:
+        payload["inputs"]["save_page_now"] = "true"
+    if crawl_website:
+        payload["inputs"]["crawl_website"] = "true"
+        if ia_identifier:
+            payload["inputs"]["ia_identifier"] = ia_identifier
+        if crawl_timestamp:
+            payload["inputs"]["crawl_timestamp"] = crawl_timestamp
     async with client.session.post(dispatch_url, json=payload, headers=GITHUB_HEADERS) as resp:
         if resp.status not in (200, 201, 204):
             text = await resp.text()
@@ -1709,12 +1996,14 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
     if is_interaction and not source.response.is_done():
         await source.response.defer()
     valid_tasks = []
+    spn_urls = await get_spn_urls()
     for target_url, url_type, is_silent in tasks_to_process:
         if not is_dm and await is_url_type_excluded(guild_id, url_type):
             continue
-        if await is_url_excluded_globally(archive_identifier(target_url)):
+        save_page_now = target_url in spn_urls
+        if await is_url_excluded_globally(archive_identifier(target_url, save_page_now=save_page_now)):
             continue
-        valid_tasks.append((target_url, url_type, is_silent))
+        valid_tasks.append((target_url, url_type, is_silent, save_page_now))
 
     tasks_to_process = valid_tasks
     if not tasks_to_process:
@@ -1725,7 +2014,9 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
     if user.id != OWNER_ID and not is_bot_request:
         current_jobs = client.active_jobs[user.id]
         current_queue = len(client.queued_jobs[user.id])
-        available_slots = max(0, MAX_CONCURRENT_JOBS - current_jobs) + max(0, MAX_QUEUED_JOBS - current_queue)
+        available_slots = max(0, MAX_QUEUED_JOBS - current_queue)
+        if user.id not in client.queue_cooldowns:
+            available_slots += max(0, MAX_CONCURRENT_JOBS - current_jobs)
         
         if len(tasks_to_process) > available_slots:
             tasks_to_process = tasks_to_process[:available_slots]
@@ -1740,7 +2031,7 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
     batch_id = None
     if len(tasks_to_process) > 1:
         type_counts = defaultdict(int)
-        for _, url_type, _ in tasks_to_process:
+        for _, url_type, _, _ in tasks_to_process:
             type_counts[url_type] += 1
 
         def pluralize(kind, count):
@@ -1764,7 +2055,7 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
             "archive_urls": []
         }
 
-    for target_url, url_type, is_silent in tasks_to_process:
+    for target_url, url_type, is_silent, save_page_now in tasks_to_process:
         if generation != client.job_generation(user.id):
             if batch_id:
                 client.batch_jobs.pop(batch_id, None)
@@ -1774,6 +2065,8 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
         wait_reason = None
         if current_jobs >= active_limit:
             wait_reason = f"You have {current_jobs}/{active_limit} active archive requests running, please wait for one of them to finish"
+        elif user.id in client.queue_cooldowns:
+            wait_reason = "Waiting for the five-second archive cooldown"
         elif client.queued_jobs[user.id]:
             wait_reason = "Waiting for your earlier queued requests"
 
@@ -1808,10 +2101,13 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
             if batch_id:
                 client.batch_jobs.pop(batch_id, None)
             return
-        client.queued_jobs[user.id].append((
+        job = (
             target_url, url_type, effective_silent, message_for_execution,
             guild_id, user.id, free_space, batch_id, is_bot_request
-        ))
+        )
+        if save_page_now:
+            job += (False, False, 0, {"id": uuid.uuid4().hex, "attempt": 1, "captures": [], "crawls": []})
+        client.queued_jobs[user.id].append(job)
         await client.save_state()
         await process_all_queues()
 
@@ -1828,6 +2124,7 @@ async def execute_archive_request(
     reuse_status_message=False,
     ignore_existing_item=False,
     bot_retry_count=0,
+    spn_series=None,
     trace_id=None
 ):
     """
@@ -1862,13 +2159,39 @@ async def execute_archive_request(
         "is_bot_request": is_bot_request,
         "ignore_existing_item": ignore_existing_item,
         "bot_retry_count": bot_retry_count,
+        "spn_series": spn_series,
     }
     success = False
     try:
+        save_page_now, crawl_website = website_archive_steps(spn_series)
+        crawl_timestamp = None
+        ia_identifier = None
+        if crawl_website:
+            crawl_timestamp = spn_series.get("crawl_timestamp")
+            if not crawl_timestamp:
+                if bot_retry_count and "crawl_timestamp" not in spn_series:
+                    # Older retries may already have written part of this item.
+                    crawl_number = spn_series.get("crawl_attempt", 1)
+                    ia_identifier = f"arab-news-archive-crawl-{spn_series['id']}-{crawl_number}"
+                else:
+                    crawl_timestamp = client.next_crawl_timestamp()
+                    spn_series["crawl_timestamp"] = crawl_timestamp
+                    await client.save_state()
+        if spn_series and not await claim_spn_series(target_url, spn_series["id"]):
+            if not is_silent and status_msg:
+                try:
+                    await status_msg.edit(content="➖ A Wayback series for this URL is already active or archived")
+                except Exception:
+                    pass
+            if batch_id:
+                await client.update_batch_progress(batch_id, is_success=False)
+            return
         client.dispatch_phases[trace_id] = "dispatching"
         success, error = await trigger_workflow(
-            target_url, trace_id, free_space=free_space, ignore_existing_item=ignore_existing_item,
-            request_user_id=user_id, request_generation=generation
+            target_url, trace_id,
+            free_space=free_space or bot_retry_count > 0, ignore_existing_item=ignore_existing_item or bot_retry_count > 0,
+            request_user_id=user_id, request_generation=generation, save_page_now=save_page_now, crawl_website=crawl_website,
+            ia_identifier=ia_identifier, crawl_timestamp=crawl_timestamp,
         )
         
         if success:
@@ -1889,12 +2212,16 @@ async def execute_archive_request(
             if context.get("cancel_requested") or client.pending_traces.get(trace_id) is not context:
                 return
 
-            await add_to_global_excluded_file(archive_identifier(target_url), url_type)
+            if not spn_series:
+                await add_to_global_excluded_file(archive_identifier(target_url), url_type)
             await log_history(guild_id, user_id, target_url, "queued", history_run_id, trace_id)
             
             if not batch_id and not is_silent and status_msg:
+                description = f"This {url_type.lower()} is being preserved"
+                if spn_series:
+                    description = f"Starting · {describe_website_archive(spn_series, bot_retry_count)}"
                 try:
-                    await status_msg.edit(content=f"⏳ This {url_type.lower()} is being preserved\n\n||Trace ID: `{trace_id}`||")
+                    await status_msg.edit(content=f"⏳ {description}\n\n||Trace ID: `{trace_id}`||")
                 except:
                     pass
             
@@ -1907,6 +2234,10 @@ async def execute_archive_request(
 
     if success or generation != client.job_generation(user_id):
         return
+    if spn_series:
+        followup = prepare_website_continuation(context)
+        await client.report_spn_capture(context, trace_id, followup=followup)
+        return followup
     retry = prepare_bot_retry(context)
     if retry:
         failure_message += f"\n\n⚠️ The request will be retried in {retry['wait']}"
@@ -1940,7 +2271,7 @@ async def run_reserved_archive_job(trace_id, job):
         # still reporting to Discord. Only release a reservation we still own.
         if client.starting_jobs.get(trace_id) is job:
             del client.starting_jobs[trace_id]
-            client.active_jobs[job[5]] = max(0, client.active_jobs[job[5]] - 1)
+            release_queue_slot(job[5])
             if retry and not client.queue_is_paused(job[5]):
                 asyncio.create_task(schedule_delayed_retry(retry["context"], retry["delay_seconds"]))
         await client.save_state()
@@ -1950,6 +2281,7 @@ async def check_and_process_queue(user_id):
     """Reserve capacity and give each bot request its own numbered trace."""
     started = 0
     while (not client.shutdown_requested and not client.queue_is_paused(user_id)
+           and user_id not in client.queue_cooldowns
            and client.queued_jobs[user_id]):
         next_job = client.queued_jobs[user_id][0]
         is_bot_request = len(next_job) > 8 and next_job[8]
@@ -2084,7 +2416,7 @@ async def cancel_archive_jobs(target_user_id=None):
             for trace, job in reservations.items():
                 if client.starting_jobs.get(trace) is job:
                     del client.starting_jobs[trace]
-                    client.active_jobs[job[5]] = max(0, client.active_jobs[job[5]] - 1)
+                    release_queue_slot(job[5])
             for batch_id in batch_ids:
                 client.batch_jobs.pop(batch_id, None)
             contexts = [context for context in client.pending_traces.values()
@@ -2163,7 +2495,7 @@ class HistoryPaginationView(View):
 async def help_cmd(interaction: discord.Interaction):
     embed = discord.Embed(
         title="Arab News Archive Help", 
-        description="This bot preserves downloadable media in the Internet Archive", 
+        description="This bot preserves media and selected web pages in the Internet Archive", 
         color=discord.Color.red()
     )
     embed.add_field(
@@ -2178,7 +2510,7 @@ async def help_cmd(interaction: discord.Interaction):
     )
     embed.add_field(
         name="User Commands",
-        value="`/archive` - Manually archive media from a link\n`/history` - View your archive history\n`/deletehistory` - Clear your archive history\n`/howmanyjobs [user]` - View a user's lifetime archive job count\n`/leaderboard` - View the archive leaderboard\n`/ping` - Check the bot's latency",
+        value="`/archive` - Manually archive a link\n`/history` - View your archive history\n`/deletehistory` - Clear your archive history\n`/howmanyjobs [user]` - View a user's lifetime archive job count\n`/leaderboard` - View the archive leaderboard\n`/ping` - Check the bot's latency",
         inline=False
     )
     embed.add_field(
@@ -2189,7 +2521,7 @@ async def help_cmd(interaction: discord.Interaction):
     if interaction.user.id == OWNER_ID:
         embed.add_field(
             name="Owner Commands",
-            value="`/restart` - Restart the bot\n`/shutdown` - Save state and stop the hosting workflow without starting another session",
+            value="`/spnurl` - Add, remove, or list exact URLs that use Save Page Now\n`/restart` - Restart the bot\n`/shutdown` - Save state and stop the hosting workflow without starting another session",
             inline=False
         )
     await interaction.response.send_message(embed=embed, ephemeral=False)
@@ -2234,12 +2566,52 @@ async def remove_url(interaction: discord.Interaction, url: str):
         return
 
     cleaned_url = parse_archive_url(url)
-    archive_key = archive_identifier(cleaned_url) if cleaned_url else url.strip()
-    success = await remove_from_global_excluded_file(archive_key)
+    if cleaned_url:
+        media_removed = await remove_from_global_excluded_file(archive_identifier(cleaned_url))
+        wayback_removed = await remove_from_global_excluded_file(archive_identifier(cleaned_url, save_page_now=True))
+        success = media_removed or wayback_removed
+    else:
+        success = await remove_from_global_excluded_file(url.strip())
     if success:
         await interaction.response.send_message("Removed from the global exclusion database", ephemeral=True)
     else:
         await interaction.response.send_message("Could not find that link in the global exclusion database", ephemeral=True)
+
+@client.tree.command(name="spnurl", description="Manage URLs for Wayback captures and WARC crawls (BOT OWNER ONLY)")
+@app_commands.describe(action="Change or view the Save Page Now list", url="Exact HTTP or HTTPS URL to add or remove")
+@app_commands.choices(action=[
+    app_commands.Choice(name="Add", value="add"),
+    app_commands.Choice(name="Remove", value="remove"),
+    app_commands.Choice(name="List", value="list"),
+])
+async def spn_url_command(interaction: discord.Interaction, action: app_commands.Choice[str], url: str = None):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("You are not authorized to use this command", ephemeral=True)
+        return
+
+    if action.value == "list":
+        urls = sorted(await get_spn_urls())
+        text = "\n".join(f"<{entry}>" for entry in urls)
+        if len(text) > 1900:
+            attachment = discord.File(io.BytesIO("\n".join(urls).encode("utf-8")), filename="spn_urls.txt")
+            await interaction.response.send_message("Save Page Now URLs", file=attachment, ephemeral=True)
+        else:
+            await interaction.response.send_message(text or "The Save Page Now list is empty", ephemeral=True)
+        return
+
+    target = parse_archive_url(url or "")
+    if not target:
+        await interaction.response.send_message("Enter the exact public HTTP or HTTPS URL", ephemeral=True)
+        return
+    enabled = action.value == "add"
+    changed = await set_spn_url(target, enabled)
+    if enabled:
+        message = "Added to the website archive list, submit the same URL with `/archive` to start its captures and crawls"
+        if not changed:
+            message = "This URL is already on the Save Page Now list"
+    else:
+        message = "Removed from the Save Page Now list" if changed else "This URL is absent from the Save Page Now list"
+    await interaction.response.send_message(message, ephemeral=True)
 
 @client.tree.command(name="excludechannel", description="Add channel to exclusion")
 @app_commands.checks.has_permissions(manage_channels=True)
@@ -2506,8 +2878,8 @@ async def disableallmessages(interaction: discord.Interaction):
     await disable_all_messages(interaction.guild.id, interaction.user.name)
     await interaction.response.send_message("Reading all messages has been turned off", ephemeral=True)
 
-@client.tree.command(name="archive", description="Manually archive media from a link")
-@app_commands.describe(url="A public HTTP or HTTPS link to media", free_space="Free additional storage for large downloads")
+@client.tree.command(name="archive", description="Manually archive a public link")
+@app_commands.describe(url="A public HTTP or HTTPS link", free_space="Free additional storage for large downloads")
 async def archive_cmd(interaction: discord.Interaction, url: str, free_space: bool = False):
     guild_id = interaction.guild.id if interaction.guild else None
 
@@ -2682,7 +3054,8 @@ async def traceinfo(interaction: discord.Interaction, trace_id: str):
     embed.add_field(name="Target URL", value=context.get('target_url', 'Unknown'), inline=False)
     embed.add_field(name="URL Type", value=context.get('url_type', 'Unknown'), inline=True)
     embed.add_field(name="Is Silent", value=str(context.get('is_silent', False)), inline=True)
-    embed.add_field(name="Free Space", value=str(context.get('free_space', False)), inline=True)
+    free_space = context.get("free_space", False) or context.get("bot_retry_count", 0) > 0
+    embed.add_field(name="Free Space", value=str(free_space), inline=True)
     
     start_time = context.get('start_time')
     if isinstance(start_time, datetime):
