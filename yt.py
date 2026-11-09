@@ -2096,6 +2096,47 @@ def extract_tasks_from_text(text):
             
     return tasks_to_process
 
+def extract_component_text(components):
+    for component in components:
+        content = getattr(component, "content", None)
+        if isinstance(content, str):
+            yield content
+        yield from extract_component_text(getattr(component, "children", ()))
+
+
+def extract_bot_message_archive_tasks(content, embeds, components):
+    tasks = extract_tasks_from_text(content)
+    text_parts = []
+    for embed in embeds:
+        # Automatic previews already have their source URL in the message body.
+        if embed.type not in (None, "rich"):
+            continue
+        text_parts.extend((
+            embed.url or embed.title,
+            embed.description,
+            embed.author.url or embed.author.name,
+            embed.footer.text,
+        ))
+        for field in embed.fields:
+            text_parts.extend((field.name, field.value))
+    text_parts.extend(extract_component_text(components))
+
+    seen_video_ids = {
+        get_video_id(url)
+        for url, url_type, _ in tasks
+        if get_category_for_url_type(url_type) == CAT_VIDEOS
+    }
+    for task in extract_tasks_from_text("\n".join(part for part in text_parts if part)):
+        url, url_type, _ = task
+        if get_category_for_url_type(url_type) != CAT_VIDEOS or "list" in parse_qs(urlparse(url).query):
+            continue
+        video_id = get_video_id(url)
+        if video_id and video_id not in seen_video_ids:
+            seen_video_ids.add(video_id)
+            tasks.append(task)
+    return tasks
+
+
 async def complete_existing_archive(target_url, url_type, archive_url, guild_id, user_id,
                                     source=None, is_silent=False, batch_id=None, send_response=None,
                                     trace_id=None):
@@ -3420,8 +3461,10 @@ async def on_message(message):
         # In servers, only process if bot messages are allowed
         if not await is_bot_messages_allowed(guild_id):
             return
+        tasks_to_process = extract_bot_message_archive_tasks(content, message.embeds, message.components)
+    else:
+        tasks_to_process = extract_tasks_from_text(content)
 
-    tasks_to_process = extract_tasks_from_text(content)
     if not tasks_to_process:
         return
 
