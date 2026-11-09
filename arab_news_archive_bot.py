@@ -1233,7 +1233,7 @@ async def upload_logs():
             await f.write(content)
         
         # Upload the file
-        await channel.send(file=discord.File(filename))
+        await channel.send(content="#hourly", file=discord.File(filename))
         
         # Delete the uploaded file from system
         os.remove(filename)
@@ -1737,6 +1737,36 @@ def parse_archive_url(value):
     return None
 
 
+def normalize_spn_hostname(host):
+    try:
+        return host.encode("idna").decode("ascii").lower().rstrip(".")
+    except UnicodeError:
+        return ""
+
+
+def parse_spn_domain(value):
+    url = parse_archive_url(value)
+    host = urlsplit(url).hostname if url else value.strip()
+    domain = normalize_spn_hostname(host)
+    labels = domain.split(".")
+    if len(labels) < 2 or len(domain) > 253 or not all(
+        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels
+    ):
+        return None
+    return domain.removeprefix("www.") if len(labels) > 2 else domain
+
+
+def matches_spn_rule(url, rules):
+    if url in rules:
+        return True
+    hostname = normalize_spn_hostname(urlsplit(url).hostname or "")
+    while hostname:
+        if hostname in rules:
+            return True
+        hostname = hostname.partition(".")[2]
+    return False
+
+
 def archive_identifier(url, *, save_page_now=False):
     prefix = "arab-news-spn-" if save_page_now else "arab-news-"
     return prefix + sha256(url.strip().encode("utf-8")).hexdigest()
@@ -1884,16 +1914,16 @@ async def init_excluded_db():
         await db.commit()
 
 
-async def get_spn_urls():
+async def get_spn_rules():
     async with aiosqlite.connect(EXCLUDED_DB_NAME) as db:
         async with db.execute("SELECT url FROM spn_urls") as cursor:
             return {row[0] for row in await cursor.fetchall()}
 
 
-async def set_spn_url(url, enabled):
+async def set_spn_rule(rule, enabled):
     statement = "INSERT OR IGNORE INTO spn_urls (url) VALUES (?)" if enabled else "DELETE FROM spn_urls WHERE url = ?"
     async with aiosqlite.connect(EXCLUDED_DB_NAME) as db:
-        cursor = await db.execute(statement, (url,))
+        cursor = await db.execute(statement, (rule,))
         await db.commit()
         return cursor.rowcount > 0
 
@@ -2056,11 +2086,11 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
     if is_interaction and not source.response.is_done():
         await source.response.defer()
     valid_tasks = []
-    spn_urls = await get_spn_urls()
+    spn_rules = await get_spn_rules()
     for target_url, url_type, is_silent in tasks_to_process:
         if not is_dm and await is_url_type_excluded(guild_id, url_type):
             continue
-        save_page_now = target_url in spn_urls
+        save_page_now = matches_spn_rule(target_url, spn_rules)
         if await is_url_excluded_globally(archive_identifier(target_url, save_page_now=save_page_now)):
             continue
         valid_tasks.append((target_url, url_type, is_silent, save_page_now))
@@ -2637,8 +2667,8 @@ async def remove_url(interaction: discord.Interaction, url: str):
     else:
         await interaction.response.send_message("Could not find that link in the global exclusion database", ephemeral=True)
 
-@client.tree.command(name="spnurl", description="Manage URLs for Wayback captures and WARC crawls (BOT OWNER ONLY)")
-@app_commands.describe(action="Change or view the Save Page Now list", url="Exact HTTP or HTTPS URL to add or remove")
+@client.tree.command(name="spnurl", description="Manage domains for Wayback captures and WARC crawls (BOT OWNER ONLY)")
+@app_commands.describe(action="Change or view the Save Page Now list", url="Domain such as aljazeera.com, or a website URL")
 @app_commands.choices(action=[
     app_commands.Choice(name="Add", value="add"),
     app_commands.Choice(name="Remove", value="remove"),
@@ -2650,27 +2680,33 @@ async def spn_url_command(interaction: discord.Interaction, action: app_commands
         return
 
     if action.value == "list":
-        urls = sorted(await get_spn_urls())
-        text = "\n".join(f"<{entry}>" for entry in urls)
+        rules = sorted(await get_spn_rules())
+        text = "\n".join(f"<{entry}>" if "://" in entry else f"`{entry}`" for entry in rules)
         if len(text) > 1900:
-            attachment = discord.File(io.BytesIO("\n".join(urls).encode("utf-8")), filename="spn_urls.txt")
-            await interaction.response.send_message("Save Page Now URLs", file=attachment, ephemeral=True)
+            attachment = discord.File(io.BytesIO("\n".join(rules).encode("utf-8")), filename="spn_urls.txt")
+            await interaction.response.send_message("Save Page Now entries", file=attachment, ephemeral=True)
         else:
             await interaction.response.send_message(text or "The Save Page Now list is empty", ephemeral=True)
         return
 
-    target = parse_archive_url(url or "")
-    if not target:
-        await interaction.response.send_message("Enter the exact public HTTP or HTTPS URL", ephemeral=True)
-        return
     enabled = action.value == "add"
-    changed = await set_spn_url(target, enabled)
+    value = url or ""
+    # Full URLs identify legacy entries on removal. Domain rules are removed by name.
+    exact_url = parse_archive_url(value) if not enabled else None
+    rule = exact_url or parse_spn_domain(value)
+    if not rule:
+        await interaction.response.send_message("Enter a domain such as `aljazeera.com`", ephemeral=True)
+        return
+    changed = await set_spn_rule(rule, enabled)
     if enabled:
-        message = "Added to the website archive list, submit the same URL with `/archive` to start its captures and crawls"
-        if not changed:
-            message = "This URL is already on the Save Page Now list"
+        message = (f"Added `{rule}` and its subdomains for Save Page Now and WARC crawls"
+                   if changed else f"`{rule}` is already on the Save Page Now list")
+    elif exact_url:
+        message = (f"Removed <{exact_url}> from the Save Page Now list" if changed else
+                   "No matching URL entry, use the domain shown in the list to remove a domain rule")
     else:
-        message = "Removed from the Save Page Now list" if changed else "This URL is absent from the Save Page Now list"
+        message = (f"Removed `{rule}` from the Save Page Now list"
+                   if changed else f"`{rule}` is absent from the Save Page Now list")
     await interaction.response.send_message(message, ephemeral=True)
 
 @client.tree.command(name="excludechannel", description="Add channel to exclusion")
