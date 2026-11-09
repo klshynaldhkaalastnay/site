@@ -18,7 +18,7 @@ import mimetypes
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
-from urllib.parse import urlsplit
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 from dotenv import load_dotenv
 import internetarchive as ia
 
@@ -68,6 +68,10 @@ CRAWL_JOB_TIMEOUT_SECONDS = 45 * 60
 JOB_RETRY_DELAY_SECONDS = 2 * 60 * 60
 SPN_CAPTURE_COUNT = 5
 SPN_CAPTURE_INTERVAL_SECONDS = 60 * 60
+SPN_TRACKING_PARAMS = {
+    "traffic_source", "fbclid", "gclid", "dclid", "gbraid", "wbraid",
+    "msclkid", "twclid", "ttclid", "igshid", "mc_cid", "mc_eid",
+}
 BOT_RETRY_SCHEDULE = (
     (60 * 60, "1 hour"),
     (2 * 60 * 60, "2 hours"),
@@ -80,6 +84,14 @@ def is_bot_trace_id(trace_id):
     return trace_id == BOT_REQUEST_TRACE_ID or bool(re.fullmatch(
         rf"{re.escape(BOT_REQUEST_TRACE_ID)}-[0-9]+", trace_id or ""
     ))
+
+
+def archive_queue_key(user_id, spn_series=None):
+    return user_id, bool(spn_series)
+
+
+def queued_job_key(job):
+    return archive_queue_key(job[5], job[12] if len(job) > 12 else None)
 
 
 def format_archive_complete(icon, status_text, archive_url, trace_id=None):
@@ -233,6 +245,13 @@ class ArchiveBot(discord.Client):
         async with self.state_lock:
             await self._save_state()
 
+    def active_jobs_by_user(self):
+        counts = defaultdict(int)
+        for (user_id, _), count in self.active_jobs.items():
+            if count:
+                counts[user_id] += count
+        return dict(counts)
+
     async def _save_state(self):
         """Save the current state of pending traces and queued jobs to a file"""
         logging.info("Saving state")
@@ -241,7 +260,7 @@ class ArchiveBot(discord.Client):
             "last_crawl_second": self.last_crawl_second,
             "pending_traces": {},
             "queued_jobs": {},
-            "active_jobs": dict(self.active_jobs),
+            "active_jobs": self.active_jobs_by_user(),
             "batch_jobs": {}
         }
 
@@ -286,9 +305,12 @@ class ArchiveBot(discord.Client):
 
         # A process can stop during preflight/dispatch. Save those reservations
         # as queued work too, instead of restoring a count with no matching job.
-        jobs_to_save = {uid: list(jobs) for uid, jobs in self.queued_jobs.items()}
+        # Keep checkpoints grouped by user. The saved series identifies the queue.
+        jobs_to_save = defaultdict(list)
+        for (user_id, _), jobs in self.queued_jobs.items():
+            jobs_to_save[user_id].extend(jobs)
         for job in reversed(list(self.starting_jobs.values())):
-            jobs_to_save.setdefault(job[5], []).insert(0, job)
+            jobs_to_save[job[5]].insert(0, job)
 
         # Serialize queued_jobs
         for user_id, jobs in jobs_to_save.items():
@@ -414,14 +436,11 @@ class ArchiveBot(discord.Client):
                 }
 
             # Restore queued_jobs
-            for user_id_str, jobs_data in state.get("queued_jobs", {}).items():
-                user_id = int(user_id_str)
-                restored_jobs = []
+            self.queued_jobs.clear()
+            for jobs_data in state.get("queued_jobs", {}).values():
                 for job_data in jobs_data:
                     msg = self.restore_message_reference(job_data.get("message_data"))
-                    
-                    # Reconstruct tuple
-                    restored_jobs.append((
+                    job = (
                         job_data["target_url"],
                         job_data["url_type"],
                         job_data["is_silent"],
@@ -435,16 +454,17 @@ class ArchiveBot(discord.Client):
                         job_data.get("ignore_existing_item", False),
                         job_data.get("bot_retry_count", 0),
                         job_data.get("spn_series"),
-                    ))
-                self.queued_jobs[user_id] = restored_jobs
+                    )
+                    self.queued_jobs[queued_job_key(job)].append(job)
 
             for context in self.pending_traces.values():
-                self.active_jobs[context["user_id"]] += 1
+                queue_key = archive_queue_key(context["user_id"], context.get("spn_series"))
+                self.active_jobs[queue_key] += 1
             for trace_id in self.pending_traces:
                 if is_bot_trace_id(trace_id) and trace_id != BOT_REQUEST_TRACE_ID:
                     self.bot_trace_counter = max(self.bot_trace_counter, int(trace_id.rsplit("-", 1)[1]))
             saved_counts = {int(k): v for k, v in state.get("active_jobs", {}).items() if v}
-            actual_counts = {uid: count for uid, count in self.active_jobs.items() if count}
+            actual_counts = self.active_jobs_by_user()
             if saved_counts != actual_counts:
                 logging.warning("Repaired stale active job counts: saved=%s restored=%s", saved_counts, actual_counts)
             logging.info(f"State loaded: {len(self.pending_traces)} pending traces, {sum(map(len, self.queued_jobs.values()))} queued jobs")
@@ -630,7 +650,7 @@ class ArchiveBot(discord.Client):
                 True, # reuse the existing status message
                 context.get("ignore_existing_item", False)
             )
-            client.queued_jobs[user_id].insert(0, queued_job)
+            client.queued_jobs[queued_job_key(queued_job)].insert(0, queued_job)
             
             if actual_run_id:
                 async with aiosqlite.connect(DB_NAME) as db:
@@ -943,7 +963,7 @@ async def enqueue_delayed_retry(context):
         context.get("spn_series"),
     )
 
-    client.queued_jobs[user_id].append(queued_job)
+    client.queued_jobs[queued_job_key(queued_job)].append(queued_job)
     await client.save_state()
     await process_all_queues()
 
@@ -981,24 +1001,24 @@ def release_archive_request(trace_id, context):
     if client.pending_traces.get(trace_id) is not context:
         return
     del client.pending_traces[trace_id]
-    release_queue_slot(context["user_id"])
+    release_queue_slot(archive_queue_key(context["user_id"], context.get("spn_series")))
 
 
-def release_queue_slot(user_id):
-    client.active_jobs[user_id] = max(0, client.active_jobs[user_id] - 1)
-    timer = client.queue_cooldowns.pop(user_id, None)
+def release_queue_slot(queue_key):
+    client.active_jobs[queue_key] = max(0, client.active_jobs[queue_key] - 1)
+    timer = client.queue_cooldowns.pop(queue_key, None)
     if timer is not None:
         timer.cancel()
     if client.shutdown_requested:
         return
 
     def resume_queue():
-        client.queue_cooldowns.pop(user_id, None)
+        client.queue_cooldowns.pop(queue_key, None)
         if not client.shutdown_requested:
-            asyncio.create_task(check_and_process_queue(user_id))
+            asyncio.create_task(check_and_process_queue(queue_key))
 
     loop = asyncio.get_running_loop()
-    client.queue_cooldowns[user_id] = loop.call_later(QUEUE_COOLDOWN_SECONDS, resume_queue)
+    client.queue_cooldowns[queue_key] = loop.call_later(QUEUE_COOLDOWN_SECONDS, resume_queue)
 
 
 async def finish_archive_request(trace_id, context, run):
@@ -1767,6 +1787,20 @@ def matches_spn_rule(url, rules):
     return False
 
 
+def strip_spn_tracking(url):
+    parsed = urlsplit(url)
+    if not parsed.query:
+        return url
+    kept = []
+    for parameter in parsed.query.split("&"):
+        name = unquote_plus(parameter.partition("=")[0]).lower()
+        if name.startswith("utm_") or name in SPN_TRACKING_PARAMS:
+            continue
+        kept.append(parameter)
+    query = "&".join(kept)
+    return urlunsplit(parsed._replace(query=query)) if query != parsed.query else url
+
+
 def archive_identifier(url, *, save_page_now=False):
     prefix = "arab-news-spn-" if save_page_now else "arab-news-"
     return prefix + sha256(url.strip().encode("utf-8")).hexdigest()
@@ -2095,11 +2129,22 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
     if is_interaction and not source.response.is_done():
         await source.response.defer()
     valid_tasks = []
-    spn_rules = await get_spn_rules()
+    seen_spn_urls = set()
+    spn_rules = {strip_spn_tracking(rule) for rule in await get_spn_rules()}
     for target_url, url_type, is_silent in tasks_to_process:
         if not is_dm and await is_url_type_excluded(guild_id, url_type):
             continue
-        save_page_now = matches_spn_rule(target_url, spn_rules)
+        spn_url = strip_spn_tracking(target_url)
+        save_page_now = matches_spn_rule(spn_url, spn_rules)
+        if save_page_now:
+            if spn_url in seen_spn_urls:
+                continue
+            seen_spn_urls.add(spn_url)
+            if spn_url != target_url and await is_url_excluded_globally(
+                archive_identifier(target_url, save_page_now=True)
+            ):
+                continue
+            target_url = spn_url
         if await is_url_excluded_globally(archive_identifier(target_url, save_page_now=save_page_now)):
             continue
         valid_tasks.append((target_url, url_type, is_silent, save_page_now))
@@ -2111,21 +2156,31 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
         return
 
     if user.id != OWNER_ID and not is_bot_request:
-        current_jobs = client.active_jobs[user.id]
-        current_queue = len(client.queued_jobs[user.id])
-        available_slots = max(0, MAX_QUEUED_JOBS - current_queue)
-        if user.id not in client.queue_cooldowns:
-            available_slots += max(0, MAX_CONCURRENT_JOBS - current_jobs)
-        
-        if len(tasks_to_process) > available_slots:
-            tasks_to_process = tasks_to_process[:available_slots]
-            if not is_interaction:
-                await source.reply(f"Some links were skipped because you reached the maximum limit of {MAX_CONCURRENT_JOBS} active and {MAX_QUEUED_JOBS} queued jobs", delete_after=10)
+        available_slots = {}
+        for save_page_now in (False, True):
+            queue_key = archive_queue_key(user.id, save_page_now)
+            free_active = 0
+            if queue_key not in client.queue_cooldowns:
+                free_active = max(0, MAX_CONCURRENT_JOBS - client.active_jobs.get(queue_key, 0))
+            queued_count = len(client.queued_jobs.get(queue_key, ()))
+            available_slots[save_page_now] = max(0, MAX_QUEUED_JOBS + free_active - queued_count)
 
-    if not tasks_to_process:
-        if is_interaction:
-            await send_response(f"You have reached the maximum limit of {MAX_CONCURRENT_JOBS} active and {MAX_QUEUED_JOBS} queued jobs", ephemeral=True)
-        return
+        accepted = []
+        for task in tasks_to_process:
+            save_page_now = task[3]
+            if available_slots[save_page_now]:
+                accepted.append(task)
+                available_slots[save_page_now] -= 1
+        if len(accepted) < len(tasks_to_process):
+            limits = f"{MAX_CONCURRENT_JOBS} active and {MAX_QUEUED_JOBS} queued jobs"
+            if not is_interaction:
+                await source.reply(f"Some links were skipped because their queue reached its limit of {limits}", delete_after=10)
+            elif not accepted:
+                queue_name = "SPN" if tasks_to_process[0][3] else "regular"
+                await send_response(f"Your {queue_name} queue has reached its limit of {limits}", ephemeral=True)
+        tasks_to_process = accepted
+        if not tasks_to_process:
+            return
 
     batch_id = None
     if len(tasks_to_process) > 1:
@@ -2160,13 +2215,16 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
                 client.batch_jobs.pop(batch_id, None)
             return
         effective_silent = is_silent or batch_id is not None
-        current_jobs = client.active_jobs[user.id]
+        queue_key = archive_queue_key(user.id, save_page_now)
+        queue_name = "SPN" if save_page_now else "regular"
+        current_jobs = client.active_jobs[queue_key]
+        queue = client.queued_jobs[queue_key]
         wait_reason = None
         if current_jobs >= active_limit:
-            wait_reason = f"You have {current_jobs}/{active_limit} active archive requests running, please wait for one of them to finish"
-        elif user.id in client.queue_cooldowns:
+            wait_reason = f"You have {current_jobs}/{active_limit} active requests in the {queue_name} queue"
+        elif queue_key in client.queue_cooldowns:
             wait_reason = "Waiting for the five-second archive cooldown"
-        elif client.queued_jobs[user.id]:
+        elif queue:
             wait_reason = "Waiting for your earlier queued requests"
 
         message_for_execution = None
@@ -2176,9 +2234,9 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
         else:
             if is_interaction:
                 if wait_reason:
-                    queue_pos = len(client.queued_jobs[user.id]) + 1
+                    queue_pos = len(queue) + 1
                     text = (
-                        f"Your request for this {url_type.lower()} has been added to the queue (Position: {queue_pos})\n\n"
+                        f"Your request for this {url_type.lower()} has been added to the {queue_name} queue (Position: {queue_pos})\n\n"
                         f"||{wait_reason}||"
                     )
                 else:
@@ -2187,9 +2245,9 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
                 message_for_execution = await send_response(text)
             else:
                 if wait_reason and not effective_silent:
-                    queue_pos = len(client.queued_jobs[user.id]) + 1
+                    queue_pos = len(queue) + 1
                     await source.reply(
-                        f"Your request for this {url_type.lower()} has been added to the queue (Position: {queue_pos})\n\n"
+                        f"Your request for this {url_type.lower()} has been added to the {queue_name} queue (Position: {queue_pos})\n\n"
                         f"||{wait_reason}||",
                         delete_after=10
                     )
@@ -2206,7 +2264,7 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
         )
         if save_page_now:
             job += (False, False, 0, {"id": uuid.uuid4().hex, "attempt": 1, "captures": [], "crawls": []})
-        client.queued_jobs[user.id].append(job)
+        queue.append(job)
         await client.save_state()
         await process_all_queues()
 
@@ -2286,8 +2344,9 @@ async def execute_archive_request(
                 await client.update_batch_progress(batch_id, is_success=False)
             return
         client.dispatch_phases[trace_id] = "dispatching"
+        workflow_url = strip_spn_tracking(target_url) if spn_series else target_url
         success, error = await trigger_workflow(
-            target_url, trace_id,
+            workflow_url, trace_id,
             free_space=free_space or bot_retry_count > 0, ignore_existing_item=ignore_existing_item or bot_retry_count > 0,
             request_user_id=user_id, request_generation=generation, save_page_now=save_page_now, crawl_website=crawl_website,
             ia_identifier=ia_identifier, crawl_timestamp=crawl_timestamp,
@@ -2352,13 +2411,14 @@ async def execute_archive_request(
 
 async def run_reserved_archive_job(trace_id, job):
     """Release a reservation exactly once unless a workflow now owns it."""
+    queue_key = queued_job_key(job)
     retry = None
     try:
         await client.save_state()
         retry = await execute_archive_request(*job, trace_id=trace_id)
     except asyncio.CancelledError:
         if client.starting_jobs.get(trace_id) is job and not client.queue_is_paused(job[5]):
-            client.queued_jobs[job[5]].insert(0, job)
+            client.queued_jobs[queue_key].insert(0, job)
         raise
     except Exception:
         logging.exception("Archive dispatch task failed for %s", job[0])
@@ -2370,27 +2430,28 @@ async def run_reserved_archive_job(trace_id, job):
         # still reporting to Discord. Only release a reservation we still own.
         if client.starting_jobs.get(trace_id) is job:
             del client.starting_jobs[trace_id]
-            release_queue_slot(job[5])
+            release_queue_slot(queue_key)
             if retry and not client.queue_is_paused(job[5]):
                 asyncio.create_task(schedule_delayed_retry(retry["context"], retry["delay_seconds"]))
         await client.save_state()
         await process_all_queues()
 
-async def check_and_process_queue(user_id):
+async def check_and_process_queue(queue_key):
     """Reserve capacity and give each bot request its own numbered trace."""
+    user_id, _ = queue_key
+    queue = client.queued_jobs[queue_key]
     started = 0
     while (not client.shutdown_requested and not client.queue_is_paused(user_id)
-           and user_id not in client.queue_cooldowns
-           and client.queued_jobs[user_id]):
-        next_job = client.queued_jobs[user_id][0]
+           and queue_key not in client.queue_cooldowns and queue):
+        next_job = queue[0]
         is_bot_request = len(next_job) > 8 and next_job[8]
         active_limit = MAX_BOT_CONCURRENT_JOBS if is_bot_request else MAX_CONCURRENT_JOBS
-        if client.active_jobs[user_id] >= active_limit:
+        if client.active_jobs[queue_key] >= active_limit:
             break
-        next_job = client.queued_jobs[user_id].pop(0)
+        next_job = queue.pop(0)
         trace_id = client.next_bot_trace_id() if is_bot_request else str(uuid.uuid4())[:8]
         client.starting_jobs[trace_id] = next_job
-        client.active_jobs[user_id] += 1
+        client.active_jobs[queue_key] += 1
         task = asyncio.create_task(run_reserved_archive_job(trace_id, next_job))
         client.dispatch_tasks.add(task)
         client.dispatch_task_details[task] = (trace_id, next_job)
@@ -2403,8 +2464,8 @@ async def check_and_process_queue(user_id):
 
 
 async def process_all_queues():
-    for user_id in list(client.queued_jobs):
-        await check_and_process_queue(user_id)
+    for queue_key in list(client.queued_jobs):
+        await check_and_process_queue(queue_key)
 
 
 async def request_workflow_cancellation(context):
@@ -2467,10 +2528,9 @@ async def cancel_archive_jobs(target_user_id=None):
                   "github_accepted":0, "github_waiting":0}
         batch_ids = set()
         try:
-            for uid in list(client.queued_jobs):
-                if matches(uid):
-                    old_jobs = client.queued_jobs[uid]
-                    client.queued_jobs[uid] = []
+            for queue_key in list(client.queued_jobs):
+                if matches(queue_key[0]):
+                    old_jobs = client.queued_jobs.pop(queue_key)
                     result["queued_removed"] += len(old_jobs)
                     batch_ids.update(job[7] for job in old_jobs if len(job) > 7 and job[7])
             selected_traces = set()
@@ -2515,7 +2575,7 @@ async def cancel_archive_jobs(target_user_id=None):
             for trace, job in reservations.items():
                 if client.starting_jobs.get(trace) is job:
                     del client.starting_jobs[trace]
-                    release_queue_slot(job[5])
+                    release_queue_slot(queued_job_key(job))
             for batch_id in batch_ids:
                 client.batch_jobs.pop(batch_id, None)
             contexts = [context for context in client.pending_traces.values()
@@ -2666,9 +2726,10 @@ async def remove_url(interaction: discord.Interaction, url: str):
 
     cleaned_url = parse_archive_url(url)
     if cleaned_url:
-        media_removed = await remove_from_global_excluded_file(archive_identifier(cleaned_url))
-        wayback_removed = await remove_from_global_excluded_file(archive_identifier(cleaned_url, save_page_now=True))
-        success = media_removed or wayback_removed
+        success = await remove_from_global_excluded_file(archive_identifier(cleaned_url))
+        for spn_url in {cleaned_url, strip_spn_tracking(cleaned_url)}:
+            removed = await remove_from_global_excluded_file(archive_identifier(spn_url, save_page_now=True))
+            success = success or removed
     else:
         success = await remove_from_global_excluded_file(url.strip())
     if success:
@@ -3005,12 +3066,25 @@ async def jobs(interaction: discord.Interaction):
         await interaction.response.send_message("You are not authorized to use this command", ephemeral=True)
         return
     
-    active_users = {uid: count for uid, count in client.active_jobs.items() if count > 0}
-    queued_users = {uid: len(queue) for uid, queue in client.queued_jobs.items() if queue}
     embed = discord.Embed(title="Arab News Archive Queue", color=discord.Color.blue())
-    lines = [f"<@{uid}>: {active_users.get(uid, 0)} active, {queued_users.get(uid, 0)} queued"
-             for uid in sorted(set(active_users) | set(queued_users))]
-    embed.description = ("\n".join(lines)[:3900] if lines else "No active or queued jobs right now")
+    queue_keys = sorted(client.active_jobs.keys() | client.queued_jobs.keys())
+    sections = []
+    for save_page_now, label in ((False, "Regular"), (True, "SPN")):
+        lines = []
+        active = queued = 0
+        for queue_key in queue_keys:
+            user_id, is_spn = queue_key
+            if is_spn != save_page_now:
+                continue
+            active_count = client.active_jobs.get(queue_key, 0)
+            queued_count = len(client.queued_jobs.get(queue_key, ()))
+            if active_count or queued_count:
+                lines.append(f"<@{user_id}>: {active_count} active, {queued_count} queued")
+                active += active_count
+                queued += queued_count
+        summary = f"**{label}** · {active} active, {queued} queued"
+        sections.append(summary + "\n" + "\n".join(lines)[:1850] if lines else summary)
+    embed.description = "\n\n".join(sections)
     bot_traces = [(trace_id, context) for trace_id, context in client.pending_traces.items()
                   if context.get("is_bot_request") or is_bot_trace_id(trace_id)]
     if bot_traces:
@@ -3021,7 +3095,9 @@ async def jobs(interaction: discord.Interaction):
         embed.add_field(name="Active bot requests", value="\n".join(bot_lines)[:1024], inline=False)
     if client.github_poll_error:
         embed.add_field(name="GitHub polling error", value=client.github_poll_error[:1024], inline=False)
-    embed.set_footer(text=f"{sum(active_users.values())} active, {sum(queued_users.values())} queued, {len(client.starting_jobs)} starting")
+    embed.set_footer(text=f"{sum(client.active_jobs.values())} active, "
+                          f"{sum(map(len, client.queued_jobs.values()))} queued, "
+                          f"{len(client.starting_jobs)} starting")
     await interaction.response.send_message(embed=embed)
 
 @client.tree.command(name="howmanyjobs", description="Show a user's archive jobs count")
