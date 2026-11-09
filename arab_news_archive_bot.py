@@ -1870,7 +1870,15 @@ def extract_tasks_from_text(text):
     return tasks
 
 
-def extract_message_archive_tasks(content, embeds):
+def extract_component_text(components):
+    for component in components:
+        content = getattr(component, "content", None)
+        if isinstance(content, str):
+            yield content
+        yield from extract_component_text(getattr(component, "children", ()))
+
+
+def extract_message_archive_tasks(content, embeds, components=()):
     text_parts = [content]
     for embed in embeds:
         # Automatic link previews already have their source URL in the message body.
@@ -1884,6 +1892,7 @@ def extract_message_archive_tasks(content, embeds):
         ))
         for field in embed.fields:
             text_parts.extend((field.name, field.value))
+    text_parts.extend(extract_component_text(components))
     return list(dict.fromkeys(
         task for text in text_parts if text for task in extract_tasks_from_text(text)
     ))
@@ -3299,7 +3308,7 @@ async def on_message(message):
         if not await is_bot_messages_allowed(guild_id):
             return
 
-    tasks_to_process = extract_message_archive_tasks(content, message.embeds)
+    tasks_to_process = extract_message_archive_tasks(content, message.embeds, message.components)
     if not tasks_to_process:
         return
 
