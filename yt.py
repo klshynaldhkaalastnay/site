@@ -83,6 +83,33 @@ def is_bot_trace_id(trace_id):
     ))
 
 
+def parse_upcoming_live_event(log_text):
+    text = re.sub(r"\x1b\[[0-9;]*m", "", log_text)
+    matches = list(re.finditer(r"This live event will begin in ([^\r\n]+)", text, re.IGNORECASE))
+    if not matches:
+        return None
+    time_text = re.split(r"\.(?:\s|$)", matches[-1][1], maxsplit=1)[0].strip()
+    if time_text.casefold() in ("a few moments", "a moment", "a few seconds"):
+        return time_text, 60
+
+    units = {
+        "second": 1, "minute": 60, "hour": 3600, "day": 86400,
+        "week": 604800, "month": 2592000, "year": 31536000,
+    }
+    duration_text = re.sub(r"^(?:less than|under)\s+", "", time_text, flags=re.IGNORECASE)
+    pattern = r"(\d+(?:\.\d+)?|an?)\s*(seconds?|minutes?|hours?|days?|weeks?|months?|years?)\b"
+    parts = list(re.finditer(pattern, duration_text, re.IGNORECASE))
+    remaining = re.sub(pattern, "", duration_text, flags=re.IGNORECASE)
+    if not parts or re.sub(r"[\s,]+|\band\b", "", remaining, flags=re.IGNORECASE):
+        return None
+    seconds = sum(
+        (1 if part[1].casefold() in ("a", "an") else float(part[1]))
+        * units[part[2].casefold().rstrip("s")]
+        for part in parts
+    )
+    return time_text, seconds
+
+
 def format_archive_complete(icon, status_text, archive_url, trace_id=None):
     message = (
         f"{icon} Archive Complete\n"
@@ -778,6 +805,33 @@ class ArchiveBot(discord.Client):
 
         archive_succeeded = exit_code == 0 or is_already_archived
 
+        live_event = parse_upcoming_live_event(log_text) if not archive_succeeded else None
+        if live_event and video_id and get_category_for_url_type(url_type) == CAT_VIDEOS:
+            time_text, seconds_until_start = live_event
+            retry_at = int(datetime.now(timezone.utc).timestamp() + seconds_until_start + 3600) + 1
+            await set_global_exclusion_expiry(video_id, retry_at=retry_at)
+            await update_history_status(actual_run_id or context["history_run_id"], "Waiting for live event")
+            if context.get("cancel_requested"):
+                return
+            # Save the completed run as a waiting retry in the same snapshot.
+            release_archive_request(trace_id, context)
+            asyncio.create_task(schedule_timeout_retry(context, retry_at=retry_at))
+            await self.save_state()
+            if not is_silent and status_msg:
+                try:
+                    await status_msg.edit(
+                        content=(
+                            "<:warning:1492123648377618582> Waiting for live event\n"
+                            f"Status: This is a live event that will begin in {time_text}\n"
+                            f"Archive retry: <t:{retry_at}:F> (<t:{retry_at}:R>)\n\n"
+                            f"||Trace ID: `{trace_id}`||"
+                        ),
+                        embed=None,
+                    )
+                except Exception as error:
+                    logging.warning("Could not show live event status for trace %s: %s", trace_id, error)
+            return
+
         if archive_succeeded and video_id:
             try:
                 await make_global_exclusion_permanent(video_id)
@@ -913,9 +967,11 @@ class ArchiveBot(discord.Client):
 
 client = ArchiveBot()
 
-def schedule_timeout_retry(context):
+def schedule_timeout_retry(context, retry_at=None):
     """Register immediately so /cancelalljobs also catches timers not yet started."""
     user_id = context["user_id"]
+    if retry_at is None:
+        retry_at = datetime.now(timezone.utc).timestamp() + JOB_RETRY_DELAY_SECONDS
     retry_id = uuid.uuid4().hex
     generation = client.job_generation(user_id)
     record = {"context": context, "task": None}
@@ -927,7 +983,7 @@ def schedule_timeout_retry(context):
         try:
             if retry_id not in client.delayed_retry_jobs or context.get("cancel_requested"):
                 return
-            await asyncio.sleep(JOB_RETRY_DELAY_SECONDS)
+            await asyncio.sleep(max(0, retry_at - datetime.now(timezone.utc).timestamp()))
             if (retry_id not in client.delayed_retry_jobs or context.get("cancel_requested")
                     or generation != client.job_generation(user_id)):
                 return
@@ -1834,16 +1890,20 @@ async def make_global_exclusion_permanent(video_id):
         await db.commit()
         return cursor.rowcount > 0
 
-async def set_global_exclusion_expiry(video_id):
+async def set_global_exclusion_expiry(video_id, retry_at=None):
     if not video_id:
         return False
 
+    expires_at = (
+        datetime.fromtimestamp(retry_at, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        if retry_at is not None else None
+    )
     async with aiosqlite.connect(EXCLUDED_DB_NAME) as db:
         cursor = await db.execute("""
             UPDATE excluded
-            SET expires_at = datetime('now', '+1 hour')
+            SET expires_at = COALESCE(?, datetime('now', '+1 hour'))
             WHERE video_id = ?
-        """, (video_id,))
+        """, (expires_at, video_id))
         await db.commit()
         return cursor.rowcount > 0
 
@@ -1992,17 +2052,53 @@ async def scan_and_dispatch_description_links(parent_video_id, parent_trace_id,
         if not description:
             return
 
-        url_regex = r'(https?://[^\s<>"]+)'
-        matches = re.findall(url_regex, description)
-        
+        link_pattern = re.compile(
+            r'(?:https?|ssh|git)://[^\s<>"\x60]+'
+            r'|(?<![\w./@-])[\w.-]+@(?:[\w.-]+|\[[0-9a-f:]+\]):[^\s<>"\x60]+',
+            re.IGNORECASE,
+        )
+        # Repository hosts and self-hosted examples from iagitbetter's supportedproviders.md.
+        git_hosts = {
+            "github.com", "gist.github.com", "gitlab.com", "codeberg.org",
+            "gitea.com", "try.gitea.io", "bitbucket.org", "gitflic.ru",
+            "gitee.com", "notabug.org", "git.launchpad.net", "git.code.sf.net",
+        }
+        git_host_labels = {"git", "github", "gitlab", "gitea", "forgejo", "gogs", "gitflic", "gerrit"}
         unique_links = set()
         git_links = set()
-        git_domains = ['github.com', 'gitlab.com', 'bitbucket.org', 'codeberg.org', 'gitea.com']
 
-        for raw_link in matches:
+        for raw_link in link_pattern.findall(description):
             cleaned_raw = clean_extracted_url(raw_link)
-            parsed = urlparse(cleaned_raw)
-            if parsed.hostname and any(domain in parsed.hostname for domain in git_domains):
+            try:
+                parsed = urlparse(cleaned_raw)
+                host = (parsed.hostname or "").removeprefix("www.")
+            except ValueError:
+                continue
+            if not parsed.scheme:
+                # The only schemeless matches use Git's user@host:path syntax.
+                git_links.add(cleaned_raw)
+                continue
+
+            path = parsed.path.strip("/")
+            if not host or not path or parsed.password is not None:
+                continue
+            if parsed.scheme in ("ssh", "git"):
+                git_links.add(cleaned_raw)
+                continue
+            if parsed.username is not None:
+                continue
+
+            if host == "sourceforge.net":
+                repo_path = re.match(r"p/[^/]+/[^/]+(?=/|$)", path)
+                if repo_path:
+                    git_links.add(f"https://git.code.sf.net/{repo_path[0]}")
+                continue
+            if (
+                host in git_hosts
+                or host.endswith(".googlesource.com")
+                or host.partition(".")[0] in git_host_labels
+                or path.lower().endswith(".git")
+            ):
                 git_links.add(cleaned_raw)
                 continue
 
