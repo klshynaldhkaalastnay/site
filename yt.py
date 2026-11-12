@@ -61,7 +61,8 @@ FILE_LOCK = asyncio.Lock()
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 MAX_CONCURRENT_JOBS = 4
 MAX_QUEUED_JOBS = 4
-JOB_TIMEOUT_SECONDS = 30 * 60
+JOB_TIMEOUT_SECONDS = 60 * 60
+LARGE_JOB_TIMEOUT_SECONDS = 90 * 60
 JOB_RETRY_DELAY_SECONDS = 2 * 60 * 60
 RATE_LIMIT_EXCLUSION_SECONDS = 60 * 60
 STANDARD_EXCLUSION_RETENTION_DAYS = 3
@@ -1006,7 +1007,7 @@ async def enqueue_timeout_retry(context):
         context.get("batch_id"),
         context.get("is_bot_request", False),
         context.get("is_cookie_retry", False),
-        True, # ignore_existing_item for retries after the 30-minute timeout
+        True, # ignore_existing_item for timeout retries
     )
 
     client.queued_jobs[user_id].append(queued_job)
@@ -1035,11 +1036,16 @@ def workflow_run_matches(trace_id, context, run):
     return True
 
 
+def archive_request_timeout_seconds(context):
+    return LARGE_JOB_TIMEOUT_SECONDS if context.get("free_space", False) else JOB_TIMEOUT_SECONDS
+
+
 def archive_request_expired(context):
     started_at = context.get("start_time")
     if not isinstance(started_at, datetime):
         return False
-    return datetime.now(timezone.utc).timestamp() - started_at.timestamp() > JOB_TIMEOUT_SECONDS
+    elapsed_seconds = datetime.now(timezone.utc).timestamp() - started_at.timestamp()
+    return elapsed_seconds > archive_request_timeout_seconds(context)
 
 
 def release_archive_request(trace_id, context):
@@ -1090,15 +1096,20 @@ async def expire_archive_request(trace_id, context):
     except Exception:
         logging.exception("Could not update timed out history for trace %s", trace_id)
     if not context["is_silent"] and context.get("status_msg"):
+        hours, minutes = divmod(archive_request_timeout_seconds(context) // 60, 60)
+        duration = f"{hours} hour" if minutes == 0 else f"{hours} hour and {minutes} minutes"
         try:
             await asyncio.wait_for(context["status_msg"].edit(
-                content=f"<:warning:1492123648377618582> This archive job has taken longer than 30 minutes and will be retried in about 2 hours\n\n||Trace ID: `{trace_id}`||"
+                content=(
+                    f"<:warning:1492123648377618582> This archive job has taken longer than {duration}"
+                    f" and will be retried in about 2 hours\n\n||Trace ID: `{trace_id}`||"
+                )
             ), timeout=30)
         except Exception:
             logging.warning("Could not show timeout status for trace %s", trace_id)
 
 
-@tasks.loop(seconds=15)
+@tasks.loop(seconds=20)
 async def poll_github_runs():
     if not client.pending_traces:
         await process_all_queues()
