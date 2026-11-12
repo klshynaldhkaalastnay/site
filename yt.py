@@ -61,8 +61,8 @@ FILE_LOCK = asyncio.Lock()
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 MAX_CONCURRENT_JOBS = 4
 MAX_QUEUED_JOBS = 4
-JOB_TIMEOUT_SECONDS = 60 * 60
-LARGE_JOB_TIMEOUT_SECONDS = 90 * 60
+JOB_TIMEOUT_SECONDS = 45 * 60 + 30
+LARGE_JOB_TIMEOUT_SECONDS = 60 * 60 + 3 * 60 + 30
 JOB_RETRY_DELAY_SECONDS = 2 * 60 * 60
 RATE_LIMIT_EXCLUSION_SECONDS = 60 * 60
 STANDARD_EXCLUSION_RETENTION_DAYS = 3
@@ -1096,8 +1096,16 @@ async def expire_archive_request(trace_id, context):
     except Exception:
         logging.exception("Could not update timed out history for trace %s", trace_id)
     if not context["is_silent"] and context.get("status_msg"):
-        hours, minutes = divmod(archive_request_timeout_seconds(context) // 60, 60)
-        duration = f"{hours} hour" if minutes == 0 else f"{hours} hour and {minutes} minutes"
+        minutes, seconds = divmod(archive_request_timeout_seconds(context), 60)
+        hours, minutes = divmod(minutes, 60)
+        duration_parts = [
+            f"{count} {unit}{'s' if count != 1 else ''}"
+            for count, unit in ((hours, "hour"), (minutes, "minute"), (seconds, "second"))
+            if count
+        ]
+        duration = duration_parts[-1]
+        if len(duration_parts) > 1:
+            duration = f"{', '.join(duration_parts[:-1])} and {duration}"
         try:
             await asyncio.wait_for(context["status_msg"].edit(
                 content=(
@@ -2065,52 +2073,83 @@ async def scan_and_dispatch_description_links(parent_video_id, parent_trace_id,
 
         link_pattern = re.compile(
             r'(?:https?|ssh|git)://[^\s<>"\x60]+'
-            r'|(?<![\w./@-])[\w.-]+@(?:[\w.-]+|\[[0-9a-f:]+\]):[^\s<>"\x60]+',
+            r'|(?<![\w./@-])[\w.-]+@(?P<ssh_host>[\w.-]+|\[[0-9a-f:]+\]):(?P<ssh_path>[^\s<>"\x60]+)',
             re.IGNORECASE,
         )
         # Repository hosts and self-hosted examples from iagitbetter's supportedproviders.md.
-        git_hosts = {
-            "github.com", "gist.github.com", "gitlab.com", "codeberg.org",
-            "gitea.com", "try.gitea.io", "bitbucket.org", "gitflic.ru",
-            "gitee.com", "notabug.org", "git.launchpad.net", "git.code.sf.net",
+        owner_repo_hosts = {
+            "github.com", "gist.github.com", "codeberg.org", "gitea.com",
+            "try.gitea.io", "bitbucket.org", "gitee.com", "notabug.org",
         }
+        git_hosts = owner_repo_hosts | {"gitlab.com", "gitflic.ru", "git.launchpad.net", "git.code.sf.net"}
         git_host_labels = {"git", "github", "gitlab", "gitea", "forgejo", "gogs", "gitflic", "gerrit"}
+        default_ports = {"http": 80, "https": 443, "ssh": 22, "git": 9418}
         unique_links = set()
-        git_links = set()
+        git_links = {}
 
-        for raw_link in link_pattern.findall(description):
-            cleaned_raw = clean_extracted_url(raw_link)
+        for link in link_pattern.finditer(description):
+            cleaned_raw = clean_extracted_url(link[0])
+            if link["ssh_host"]:
+                host = link["ssh_host"].lower().removeprefix("www.")
+                if host not in git_hosts:
+                    git_links.setdefault(cleaned_raw, cleaned_raw)
+                    continue
+                clone_path = clean_extracted_url(link["ssh_path"]).lstrip("/")
+                cleaned_raw = f"https://{host}/{clone_path}"
+
             try:
                 parsed = urlparse(cleaned_raw)
                 host = (parsed.hostname or "").removeprefix("www.")
+                port = parsed.port
             except ValueError:
-                continue
-            if not parsed.scheme:
-                # The only schemeless matches use Git's user@host:path syntax.
-                git_links.add(cleaned_raw)
                 continue
 
             path = parsed.path.strip("/")
+            host_label = host.partition(".")[0]
             if not host or not path or parsed.password is not None:
                 continue
-            if parsed.scheme in ("ssh", "git"):
-                git_links.add(cleaned_raw)
-                continue
-            if parsed.username is not None:
+            is_clone_url = parsed.scheme in ("ssh", "git")
+            if not is_clone_url and parsed.username is not None:
                 continue
 
-            if host == "sourceforge.net":
+            if host == "sourceforge.net" and not is_clone_url:
                 repo_path = re.match(r"p/[^/]+/[^/]+(?=/|$)", path)
-                if repo_path:
-                    git_links.add(f"https://git.code.sf.net/{repo_path[0]}")
-                continue
+                if not repo_path:
+                    continue
+                host = "git.code.sf.net"
+                path = repo_path[0]
+                parsed = parsed._replace(scheme="https", netloc=host)
+                port = None
+
             if (
-                host in git_hosts
+                is_clone_url
+                or host in git_hosts
                 or host.endswith(".googlesource.com")
-                or host.partition(".")[0] in git_host_labels
+                or host_label in git_host_labels
                 or path.lower().endswith(".git")
             ):
-                git_links.add(cleaned_raw)
+                # Resolve browser subpages to their repository before comparing links.
+                if host in owner_repo_hosts or host_label == "github":
+                    path = "/".join(path.split("/")[:2]).removesuffix(".git")
+                elif host_label == "gitlab":
+                    path = path.partition("/-/")[0]
+                    if host == "gitlab.com":
+                        path = path.removesuffix(".git")
+                elif host == "gitflic.ru":
+                    segments = 3 if path.startswith("project/") else 2
+                    path = "/".join(path.split("/")[:segments])
+                elif host == "git.code.sf.net" and path.startswith("p/"):
+                    path = "/".join(path.split("/")[:3])
+                elif host.endswith(".googlesource.com"):
+                    path = path.partition("/+/")[0]
+
+                netloc = parsed.netloc if is_clone_url else parsed.netloc.lower()
+                clean_url = parsed._replace(netloc=netloc, path=f"/{path}", params="", query="", fragment="")
+                if host in git_hosts and port in (None, default_ports.get(parsed.scheme)):
+                    clean_url = clean_url._replace(scheme="https", netloc=host)
+                git_url = clean_url.geturl()
+                key = git_url.casefold() if host_label == "github" else git_url
+                git_links.setdefault(key, git_url)
                 continue
 
             res = clean_youtube_url(cleaned_raw)
@@ -2123,7 +2162,7 @@ async def scan_and_dispatch_description_links(parent_video_id, parent_trace_id,
                 if new_video_id and new_video_id != parent_video_id:
                     unique_links.add((clean_url, new_video_id))
 
-        for git_url in git_links:
+        for git_url in git_links.values():
             if parent_generation != client.job_generation(parent_user_id):
                 return
             trace_id = parent_trace_id
