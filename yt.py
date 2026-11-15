@@ -124,7 +124,7 @@ def format_archive_complete(icon, status_text, archive_url, trace_id=None):
 
 def format_existing_archive(url_type, archive_url, trace_id=None):
     return format_archive_complete(
-        "<:minus:1455628978584027228>",
+        "<:minus:1571523116377571398>",
         f"{url_type} is already archived", archive_url, trace_id
     )
 
@@ -787,7 +787,7 @@ class ArchiveBot(discord.Client):
             if not is_silent and status_msg:
                 try:
                     await status_msg.edit(
-                        content=f"<a:loading:1455572437277348005> Storage limit reached for {url_type}, retrying with large file support\n\n||Trace ID: `{trace_id}`||"
+                        content=f"<a:loading:1571523328185868460> Storage limit reached for {url_type}, retrying with large file support\n\n||Trace ID: `{trace_id}`||"
                     )
                 except Exception:
                     pass
@@ -822,7 +822,7 @@ class ArchiveBot(discord.Client):
                 try:
                     await status_msg.edit(
                         content=(
-                            "<:warning:1492123648377618582> Waiting for live event\n"
+                            "<:warning:1571523051177377885> Waiting for live event\n"
                             f"Status: This is a live event that will begin in {time_text}\n"
                             f"Archive retry: <t:{retry_at}:F> (<t:{retry_at}:R>)\n\n"
                             f"||Trace ID: `{trace_id}`||"
@@ -875,33 +875,33 @@ class ArchiveBot(discord.Client):
             elif video_id:
                 display_url = f"https://archive.org/details/youtube-{video_id}"
             
-            icon = "<:wrong:1455628187127120068>"
+            icon = "<:wrong:1571523207649824860>"
             status_text = f"Archive failed (Exit Code: {exit_code})"
             
             if exit_code == 0:
-                icon = "<:checkmark:1455627640974344203>"
+                icon = "<:checkmark:1571523283143229551>"
                 status_text = "Archive succeeded"
 
             if is_already_archived:
-                icon = "<:minus:1455628978584027228>"
+                icon = "<:minus:1571523116377571398>"
                 status_text = f"{url_type} is already archived"
             elif youtube_rate_limited:
-                icon = "<:wrong:1455628187127120068>"
+                icon = "<:wrong:1571523207649824860>"
                 status_text = "Bot's account has been rate-limited, please try again later in an hour or so"
             elif log_text and "Please reduce your request rate." in log_text:
-                icon = "<:wrong:1455628187127120068>"
+                icon = "<:wrong:1571523207649824860>"
                 status_text = f"This {url_type} has been rejected by the Internet Archive"
             elif log_text and "requested format is not available" in log_text.casefold():
-                icon = "<:wrong:1455628187127120068>"
+                icon = "<:wrong:1571523207649824860>"
                 status_text = f"Unable to download YouTube {url_type}"
             elif log_text and "video unavailable" in log_text.casefold():
-                icon = "<:wrong:1455628187127120068>"
+                icon = "<:wrong:1571523207649824860>"
                 status_text = "Video unavailable"
             elif log_text and "the specified bucket is not valid" in log_text.casefold():
-                icon = "<:wrong:1455628187127120068>"
+                icon = "<:wrong:1571523207649824860>"
                 status_text = f"Most likely that this YouTube {url_type} is already archived"
             elif log_text and "IOException: No space left on device" in log_text:
-                icon = "<:wrong:1455628187127120068>"
+                icon = "<:wrong:1571523207649824860>"
                 status_text = f"This {url_type} is way too large"
 
             attachment_file = None
@@ -950,7 +950,7 @@ class ArchiveBot(discord.Client):
                         )
 
                     final_batch_msg = (
-                        "<:checkmark:1455627640974344203> Archive Batch Complete\n"
+                        "<:checkmark:1571523283143229551> Archive Batch Complete\n"
                         f"Processed: {batch['total']} links\n"
                         f"Successful: {batch['success']}\n"
                         f"Failed: {batch['failed']}\n"
@@ -1109,7 +1109,7 @@ async def expire_archive_request(trace_id, context):
         try:
             await asyncio.wait_for(context["status_msg"].edit(
                 content=(
-                    f"<:warning:1492123648377618582> This archive job has taken longer than {duration}"
+                    f"<:warning:1571523051177377885> This archive job has taken longer than {duration}"
                     f" and will be retried in about 2 hours\n\n||Trace ID: `{trace_id}`||"
                 )
             ), timeout=30)
@@ -1195,7 +1195,7 @@ async def poll_github_runs():
                 if not context["is_silent"] and context.get("status_msg") and not context.get("is_cookie_retry"):
                     try:
                         await asyncio.wait_for(context["status_msg"].edit(
-                            content=f"<a:loading:1455572437277348005> YouTube {context['url_type']} is being preserved\n\n||Trace ID: `{trace_id}`||"
+                            content=f"<a:loading:1571523328185868460> YouTube {context['url_type']} is being preserved\n\n||Trace ID: `{trace_id}`||"
                         ), timeout=30)
                     except Exception:
                         pass
@@ -2304,7 +2304,7 @@ async def complete_existing_archive(target_url, url_type, archive_url, guild_id,
                 await status_msg.edit(content=initial)
             else:
                 status_msg = await source.reply(initial)
-            await status_msg.edit(content=f"<a:loading:1455572437277348005> YouTube {url_type} is being preserved\n\n||Trace ID: `{trace_id}`||")
+            await status_msg.edit(content=f"<a:loading:1571523328185868460> YouTube {url_type} is being preserved\n\n||Trace ID: `{trace_id}`||")
         except Exception as error:
             logging.warning("Could not show local archive status: %s", error)
     await asyncio.sleep(5)
@@ -2466,7 +2466,7 @@ async def dispatch_archive_tasks(tasks_to_process, user, source, guild_id, free_
 
         counts_text = ", ".join(f"{count} {pluralize(kind, count)}" for kind, count in sorted(type_counts.items()))
         batch_id = str(uuid.uuid4())[:8]
-        batch_text = f"<a:loading:1455572437277348005> YouTube links are being preserved ({counts_text})\n\n||Batch ID: `{batch_id}`||"
+        batch_text = f"<a:loading:1571523328185868460> YouTube links are being preserved ({counts_text})\n\n||Batch ID: `{batch_id}`||"
         
         if is_interaction:
             batch_status_msg = await send_response(batch_text)
@@ -2635,7 +2635,7 @@ async def execute_archive_request(
             
             if not is_cookie_retry and not batch_id and not is_silent and status_msg:
                 try:
-                    await status_msg.edit(content=f"<a:loading:1455572437277348005> YouTube {url_type} is being preserved\n\n||Trace ID: `{trace_id}`||")
+                    await status_msg.edit(content=f"<a:loading:1571523328185868460> YouTube {url_type} is being preserved\n\n||Trace ID: `{trace_id}`||")
                 except:
                     pass
             
