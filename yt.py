@@ -14,10 +14,12 @@ import aiofiles
 import uuid
 import json
 import sys
+import signal
 import random
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from html import unescape
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
 from dotenv import load_dotenv
 import internetarchive as ia
@@ -179,6 +181,7 @@ class ArchiveBot(discord.Client):
         self.cookie_status_error = None
         self.github_poll_error = None
         self.shutdown_requested = False
+        self.restart_in_progress = False
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession(timeout=HTTP_TIMEOUT)
@@ -497,23 +500,47 @@ class ArchiveBot(discord.Client):
     async def load_disabled_cookies(self):
         async with aiosqlite.connect(DB_NAME) as db:
             async with db.execute(
-                "SELECT account, secret_updated_at, disabled_at, notified, run_id, trace_id "
+                "SELECT account, secret_updated_at, disabled_at, notified, run_id, trace_id, disabled_by_owner "
                 "FROM disabled_youtube_cookies"
             ) as cursor:
-                for account, version, disabled_at, notified, run_id, trace_id in await cursor.fetchall():
+                for account, version, disabled_at, notified, run_id, trace_id, disabled_by_owner in await cursor.fetchall():
                     self.disabled_cookies[account] = {
                         "secret_updated_at": version, "disabled_at": disabled_at,
                         "notified": bool(notified), "run_id": run_id, "trace_id": trace_id,
+                        "disabled_by_owner": bool(disabled_by_owner),
                     }
 
     def available_youtube_accounts(self):
         return [account for account in YOUTUBE_COOKIE_SECRETS
                 if account in self.cookie_secret_versions and account not in self.disabled_cookies]
 
+    async def set_youtube_cookie_enabled(self, account, enabled):
+        async with self.cookie_lock, aiosqlite.connect(DB_NAME) as db:
+            if enabled:
+                await db.execute("DELETE FROM disabled_youtube_cookies WHERE account = ?", (account,))
+                await db.commit()
+                self.disabled_cookies.pop(account, None)
+                return
+
+            disabled_at = datetime.now(timezone.utc).isoformat()
+            await db.execute(
+                """
+                INSERT INTO disabled_youtube_cookies (account, disabled_at, disabled_by_owner)
+                VALUES (?, ?, 1)
+                ON CONFLICT(account) DO UPDATE SET
+                    disabled_at = excluded.disabled_at,
+                    disabled_by_owner = excluded.disabled_by_owner
+                """,
+                (account, disabled_at),
+            )
+            await db.commit()
+            state = self.disabled_cookies.setdefault(account, {})
+            state.update(disabled_at=disabled_at, disabled_by_owner=True)
+
     async def notify_disabled_cookies(self):
         # Called with cookie_lock held, so simultaneous failures cannot spam DMs
         for account, state in self.disabled_cookies.items():
-            if state["notified"] or not OWNER_ID:
+            if state.get("disabled_by_owner") or state["notified"] or not OWNER_ID:
                 continue
             secret_name = YOUTUBE_COOKIE_SECRETS[account]
             message = (
@@ -574,6 +601,8 @@ class ArchiveBot(discord.Client):
 
             async with aiosqlite.connect(DB_NAME) as db:
                 for account, state in list(self.disabled_cookies.items()):
+                    if state.get("disabled_by_owner"):
+                        continue
                     current_version = versions.get(account)
                     if not current_version:
                         continue  # A missing/deleted secret does not enable the account
@@ -727,7 +756,22 @@ class ArchiveBot(discord.Client):
         if context.get("cancel_requested"):
             return
         invalid_cookies = has_invalid_youtube_cookies(log_text)
-        history_status = "Archived" if exit_code == 0 and not invalid_cookies else "Failed"
+        no_space_left = "IOException: No space left on device" in log_text
+        retry_with_free_space = no_space_left and not context.get("free_space", False)
+        is_already_archived = (
+            not invalid_cookies
+            and not retry_with_free_space
+            and (
+                "Item already exists. Not downloading." in log_text
+                or "the specified bucket is not valid" in log_text.casefold()
+            )
+        )
+        if is_already_archived:
+            history_status = "Already archived"
+        elif exit_code == 0 and not invalid_cookies:
+            history_status = "Archived"
+        else:
+            history_status = "Failed"
         if actual_run_id:
             async with aiosqlite.connect(DB_NAME) as db:
                 await db.execute("UPDATE history SET run_id = ?, status = ? WHERE run_id = ?", (actual_run_id, history_status, context["history_run_id"]))
@@ -760,7 +804,7 @@ class ArchiveBot(discord.Client):
                 return
             logging.error("Expired YouTube cookies detected for trace %s but the account is unknown", trace_id)
 
-        if log_text and "IOException: No space left on device" in log_text and not context.get("free_space", False):
+        if retry_with_free_space:
             user_id = context["user_id"]
             queued_job = (
                 context["target_url"],
@@ -800,11 +844,7 @@ class ArchiveBot(discord.Client):
             and "Your account has been rate-limited by YouTube for up to an hour" in log_text
         )
 
-        is_already_archived = False
-        if log_text and "Item already exists. Not downloading." in log_text:
-            is_already_archived = True
-
-        archive_succeeded = exit_code == 0 or is_already_archived
+        archive_succeeded = history_status in ("Archived", "Already archived")
 
         live_event = parse_upcoming_live_event(log_text) if not archive_succeeded else None
         if live_event and video_id and get_category_for_url_type(url_type) == CAT_VIDEOS:
@@ -835,7 +875,7 @@ class ArchiveBot(discord.Client):
 
         if archive_succeeded and video_id:
             try:
-                await make_global_exclusion_permanent(video_id)
+                await make_global_exclusion_permanent(video_id, get_category_for_url_type(url_type))
             except Exception as e:
                 logging.error(f"Failed to make successful exclusion permanent for {video_id}: {e}")
         elif youtube_rate_limited and video_id:
@@ -851,8 +891,18 @@ class ArchiveBot(discord.Client):
                     video_id, trace_id, user_id, client.job_generation(user_id)
                 ))
 
+        if url_type == "Channel":
+            query_string = f'channel:"{original_url}"'
+            display_url = f"https://archive.org/search?query={quote(query_string)}"
+        elif video_id:
+            display_url = f"https://archive.org/details/youtube-{video_id}"
+        else:
+            display_url = original_url
+
         archive_urls = []
-        if log_text and not is_already_archived:
+        if is_already_archived and video_id:
+            archive_urls = [display_url]
+        elif log_text and not is_already_archived:
             archive_urls = re.findall(r'(https?://(?:www\.)?archive\.org/[^\s<>"\']+)', log_text)
             # Deduplicate while preserving order
             archive_urls = list(dict.fromkeys(archive_urls))
@@ -866,19 +916,10 @@ class ArchiveBot(discord.Client):
             return
 
         if not is_silent and status_msg:
-            display_url = original_url 
-
-            if url_type == "Channel":
-                query_string = f'channel:"{original_url}"'
-                encoded_query = quote(query_string)
-                display_url = f"https://archive.org/search?query={encoded_query}"
-            elif video_id:
-                display_url = f"https://archive.org/details/youtube-{video_id}"
-            
             icon = "<:wrong:1571523207649824860>"
             status_text = f"Archive failed (Exit Code: {exit_code})"
             
-            if exit_code == 0:
+            if history_status == "Archived":
                 icon = "<:checkmark:1571523283143229551>"
                 status_text = "Archive succeeded"
 
@@ -897,10 +938,7 @@ class ArchiveBot(discord.Client):
             elif log_text and "video unavailable" in log_text.casefold():
                 icon = "<:wrong:1571523207649824860>"
                 status_text = "Video unavailable"
-            elif log_text and "the specified bucket is not valid" in log_text.casefold():
-                icon = "<:wrong:1571523207649824860>"
-                status_text = f"Most likely that this YouTube {url_type} is already archived"
-            elif log_text and "IOException: No space left on device" in log_text:
+            elif no_space_left:
                 icon = "<:wrong:1571523207649824860>"
                 status_text = f"This {url_type} is way too large"
 
@@ -1313,9 +1351,16 @@ async def init_db():
                 disabled_at TEXT NOT NULL,
                 notified INTEGER NOT NULL DEFAULT 0,
                 run_id TEXT,
-                trace_id TEXT
+                trace_id TEXT,
+                disabled_by_owner INTEGER NOT NULL DEFAULT 0
             )
         """)
+        async with db.execute("PRAGMA table_info(disabled_youtube_cookies)") as cursor:
+            cookie_columns = {column[1] for column in await cursor.fetchall()}
+        if "disabled_by_owner" not in cookie_columns:
+            await db.execute(
+                "ALTER TABLE disabled_youtube_cookies ADD COLUMN disabled_by_owner INTEGER NOT NULL DEFAULT 0"
+            )
         
         await db.execute("""
             CREATE TABLE IF NOT EXISTS exclusions (
@@ -1887,25 +1932,26 @@ async def add_to_global_excluded_file(video_id, category):
     expiry_modifier = f"+{STANDARD_EXCLUSION_RETENTION_DAYS} days"
     async with aiosqlite.connect(EXCLUDED_DB_NAME) as db:
         await db.execute("""
-            INSERT INTO excluded (video_id, category, timestamp, expires_at)
+            INSERT INTO excluded AS stored (video_id, category, timestamp, expires_at)
             VALUES (?, ?, CURRENT_TIMESTAMP, datetime('now', ?))
             ON CONFLICT(video_id) DO UPDATE SET
                 category = excluded.category,
-                timestamp = CURRENT_TIMESTAMP,
-                expires_at = datetime('now', ?)
-        """, (video_id, category, expiry_modifier, expiry_modifier))
+                timestamp = excluded.timestamp,
+                expires_at = excluded.expires_at
+            WHERE stored.expires_at IS NOT NULL
+        """, (video_id, category, expiry_modifier))
         await db.commit()
 
-async def make_global_exclusion_permanent(video_id):
+async def make_global_exclusion_permanent(video_id, category=None):
     if not video_id:
         return False
 
     async with aiosqlite.connect(EXCLUDED_DB_NAME) as db:
         cursor = await db.execute("""
-            UPDATE excluded
-            SET expires_at = NULL
-            WHERE video_id = ?
-        """, (video_id,))
+            INSERT INTO excluded (video_id, category, timestamp, expires_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP, NULL)
+            ON CONFLICT(video_id) DO UPDATE SET expires_at = NULL
+        """, (video_id, category))
         await db.commit()
         return cursor.rowcount > 0
 
@@ -1921,7 +1967,7 @@ async def set_global_exclusion_expiry(video_id, retry_at=None):
         cursor = await db.execute("""
             UPDATE excluded
             SET expires_at = COALESCE(?, datetime('now', '+1 hour'))
-            WHERE video_id = ?
+            WHERE video_id = ? AND expires_at IS NOT NULL
         """, (expires_at, video_id))
         await db.commit()
         return cursor.rowcount > 0
@@ -2288,8 +2334,7 @@ async def complete_existing_archive(target_url, url_type, archive_url, guild_id,
                                     trace_id=None):
     """Record a metadata match locally and show the normal completion sequence"""
     video_id = get_video_id(target_url)
-    await add_to_global_excluded_file(video_id, get_category_for_url_type(url_type))
-    await make_global_exclusion_permanent(video_id)
+    await make_global_exclusion_permanent(video_id, get_category_for_url_type(url_type))
     trace_id = trace_id or str(uuid.uuid4())[:8]
     # No GitHub run exists, the trace identifies this local history record
     await log_history(guild_id, user_id, target_url, "Already archived", None, trace_id)
@@ -3284,6 +3329,42 @@ async def archive_cmd(interaction: discord.Interaction, url: str, free_space: bo
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(f"Pong! `{round(client.latency*1000)}ms`", ephemeral=False)
 
+@client.tree.command(name="youtubecookie", description="Enable or disable a YouTube cookie account (BOT OWNER ONLY)")
+@app_commands.describe(
+    account="YouTube cookie account number",
+    enabled="Whether the bot can use this account for new archives",
+)
+@app_commands.choices(account=[
+    app_commands.Choice(name=str(account), value=account) for account in YOUTUBE_COOKIE_SECRETS
+])
+async def youtubecookie(interaction: discord.Interaction, account: app_commands.Choice[int], enabled: bool):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("You are not authorized to use this command", ephemeral=True)
+        return
+
+    account_number = account.value
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await client.set_youtube_cookie_enabled(account_number, enabled)
+    except Exception:
+        logging.exception("Could not update YouTube cookie account %s", account_number)
+        await interaction.followup.send(f"Could not update YouTube cookie account {account_number}", ephemeral=True)
+        return
+
+    available = client.available_youtube_accounts()
+    if enabled:
+        message = f"YouTube cookie account {account_number} is enabled"
+        if account_number in available:
+            await process_all_queues()
+        else:
+            message += "\nThe bot can use it once it detects its GitHub secret"
+    else:
+        message = f"YouTube cookie account {account_number} is disabled"
+        if not available:
+            message += "\nNew jobs will wait for an available cookie account"
+    await interaction.followup.send(message, ephemeral=True)
+
+
 @client.tree.command(name="jobs", description="Show active jobs, queued requests, and queue blockers (BOT OWNER ONLY)")
 async def jobs(interaction: discord.Interaction):
     if interaction.user.id != OWNER_ID:
@@ -3298,6 +3379,12 @@ async def jobs(interaction: discord.Interaction):
     embed.description = ("\n".join(lines)[:3900] if lines else "No active or queued jobs right now")
     available = client.available_youtube_accounts()
     cookie_text = f"{len(available)}/{len(YOUTUBE_COOKIE_SECRETS)} accounts available"
+    manually_disabled = [
+        str(account) for account in YOUTUBE_COOKIE_SECRETS
+        if client.disabled_cookies.get(account, {}).get("disabled_by_owner")
+    ]
+    if manually_disabled:
+        cookie_text += f"\nDisabled by the owner ({', '.join(manually_disabled)})"
     if not available:
         if not client.cookie_metadata_loaded:
             cookie_text += "\nQueue paused until cookie secret metadata can be read"
@@ -3501,7 +3588,8 @@ async def cancelalljobs(interaction: discord.Interaction, user_id: str = None):
 
 
 @client.tree.command(name="restart", description="Restart the bot (BOT OWNER ONLY)")
-async def restart(interaction: discord.Interaction):
+@app_commands.describe(update_python_file="Download the file configured in PYTHON_FILE_URL before restarting")
+async def restart(interaction: discord.Interaction, update_python_file: bool = False):
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("You are not authorized to use this command", ephemeral=True)
         return
@@ -3509,15 +3597,79 @@ async def restart(interaction: discord.Interaction):
     if client.shutdown_requested:
         await interaction.response.send_message("The bot workflow is already shutting down", ephemeral=True)
         return
+    if client.restart_in_progress:
+        await interaction.response.send_message("A restart is already in progress", ephemeral=True)
+        return
 
-    await interaction.response.send_message("Saving state and restarting", ephemeral=True)
-    
-    await client.save_state()
-    
-    # Close connections cleanly
-    await client.close()
-    
-    # Restart the process
+    if update_python_file:
+        updater = os.getenv("WORKFLOW_PYTHON_UPDATER")
+        if not updater:
+            await interaction.response.send_message(
+                "Install the updated bot hosting workflow to use this option", ephemeral=True
+            )
+            return
+        if not os.getenv("PYTHON_FILE_URL", "").strip():
+            await interaction.response.send_message(
+                "Set the PYTHON_FILE_URL secret in the bot hosting repository to use this option", ephemeral=True
+            )
+            return
+
+    client.restart_in_progress = True
+    staged_file = None
+    try:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            if update_python_file:
+                script_file = Path(__file__).resolve()
+                staged_file = script_file.with_name(f".python-restart-{uuid.uuid4().hex}.py")
+                process = await asyncio.create_subprocess_exec(
+                    sys.executable, updater, "--stage", str(staged_file)
+                )
+                try:
+                    exit_code = await process.wait()
+                except asyncio.CancelledError:
+                    try:
+                        process.send_signal(signal.SIGINT)
+                    except ProcessLookupError:
+                        pass
+                    await process.wait()
+                    raise
+                if exit_code != 0:
+                    await interaction.followup.send(
+                        "Could not download or validate the updated bot file, check the workflow log",
+                        ephemeral=True,
+                    )
+                    return
+
+            if client.shutdown_requested:
+                await interaction.followup.send("The bot workflow is already shutting down", ephemeral=True)
+                return
+            await client.save_state()
+        except Exception:
+            logging.exception("Could not prepare the bot restart")
+            await interaction.followup.send("Could not prepare the restart, check the workflow log", ephemeral=True)
+            return
+
+        message = "Saved state and restarting"
+        if update_python_file:
+            message = "Downloaded the updated bot file and saved state, restarting"
+        await interaction.followup.send(message, ephemeral=True)
+        if client.shutdown_requested:
+            return
+        await client.close()
+        if staged_file is not None:
+            try:
+                staged_file.replace(script_file)
+            except OSError:
+                logging.exception("Could not install the downloaded bot file, restarting with the current file")
+    finally:
+        client.restart_in_progress = False
+        if staged_file is not None:
+            try:
+                staged_file.unlink(missing_ok=True)
+            except OSError:
+                logging.warning("Could not remove the staged bot file")
+
     logging.info("Restarting process")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -3537,6 +3689,9 @@ async def shutdown(interaction: discord.Interaction):
 
     if client.shutdown_requested:
         await interaction.response.send_message("The bot workflow is already shutting down", ephemeral=True)
+        return
+    if client.restart_in_progress:
+        await interaction.response.send_message("A restart is already in progress", ephemeral=True)
         return
 
     client.shutdown_requested = True
